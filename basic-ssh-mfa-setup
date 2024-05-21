@@ -1,0 +1,79 @@
+# Create a logon banner warning file
+cat > ~/banner.warn << EOF
+!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!!
+!! YOU ARE CONNECTING TO PRIVATE   !!
+!! PROPERTY. Logs are maintained-  !!
+!! and retained for legal purposes !!
+!!                                 !!
+!!  IF YOU ARE NOT AUTHORIZED TO   !!
+!!  LOGON, DISCONNECT IMMEDIATELY  !!
+!!                                 !!
+!!  Note: all cold keys have been  !!
+!!   removed from this computer    !!
+!!                                 !!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+██░▄▄░█▀▄▄▀███░▄▄▀██░███░█░▄▄▀██░███░█░█░█░██
+██░█▀▀█░██░███░▀▀░██░█░█░█░▀▀░██▄▀▀▀▄█▄█▄█▄██
+██░▀▀▄██▄▄████░██░██▄▀▄▀▄█░██░████░███▀█▀█▀██
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+               ಠ_ಠ
+EOF
+
+# Install the Google authenticator
+sudo apt install libpam-google-authenticator
+google-authenticator
+
+# This runs Google Authenticator... answer "y" to time-based tokens question
+# Scan the code to mobile Google Authenticator app and make note of the emergency scratch codes
+# Answer the questions y, y, n, y or y. y. y, y (less secure)
+
+# Configure SSH Daemon to use Google Authenticator and logon banner
+# Automated way:
+sudo sed -i 's/ChallengeResponseAuthentication no/ChallengeResponseAuthentication yes/g' /etc/ssh/sshd_config
+sudo sed -i 's/UsePAM no/UsePAM yes/g' /etc/ssh/sshd_config
+sudo sed -i 's/#Banner none/Banner \/home\/stakeman\/banner.warn/g' /etc/ssh/sshd_config
+
+# Manual way:
+# Open the SSH Daemon configuration file
+# sudo nano /etc/ssh/sshd_config
+# Change these values as shown:
+# ChallengeResponseAuthentication yes
+# UsePAM yes
+# Banner /home/stakeman/banner.warn
+
+# Change the default SSH port from 22 to something else
+# Automated way:
+sudo sed -i 's/#Port 22/Port 23232/g' /etc/ssh/sshd_config
+
+# Manual way:
+# Open the SSH Daemon configuration file
+# sudo nano /etc/ssh/sshd_config
+# Change the port value as shown:
+# Port 23232
+
+# If you are using certificate authentication add this:
+# AuthenticationMethods publickey,keyboard-interactive
+
+# Save and close the file
+# Restart SSH Daemon
+sudo systemctl restart ssh
+
+# Edit the PAM rule for the SSH daemon
+# Automated way:
+echo "# One-time password authentication via Google Authenticator" | sudo tee -a /etc/pam.d/sshd
+echo "auth required pam_google_authenticator.so" | sudo tee -a /etc/pam.d/sshd
+sudo sed -i 's/@include common-auth/#@include common-auth/g' /etc/pam.d/sshd
+
+# Manual way:
+# Open the PAM configuration file for the SSH daemon
+# sudo nano /etc/pam.d/sshd
+# Add these two lines (first one is a comment):
+# # One-time password authentication via Google Authenticator
+# auth required pam_google_authenticator.so
+# If you are using certificate authentication comment out this line:
+# #@include common-auth
+
+# Restart SSH daemon
+sudo systemctl restart ssh
