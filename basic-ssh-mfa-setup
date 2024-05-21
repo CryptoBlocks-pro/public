@@ -1,3 +1,8 @@
+#Do not close your iniitial SSH session after making these changes. 
+#Create a new session, which will use the new settings and verify they work. 
+#Otherwise, you can lock yourself out of the server and have to restore the original settings.
+
+
 # Create a logon banner warning file
 cat > ~/banner.warn << EOF
 !!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!!
