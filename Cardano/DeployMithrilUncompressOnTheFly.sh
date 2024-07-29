@@ -62,13 +62,12 @@ echo $whi"A highly compressed file will expand to roughly four times its size up
 echo
 echo $whi"Please ensure you've enough space to perform this operation."
 echo
-echo $whi"Paste your Cardano Blockchain DB Path: "
+echo $whi"Type or paste your Cardano blockchain db path, or hit enter for Guild Operators Koios Cntools default path of /opt/cardano/cnode/db: "
 echo
 
-# Get the path where the user wants to deploy the snapshot
-read -r inputPath
-
-dbdir=$inputPath
+# Get the path where the user wants to deploy the snapshot, default to /opt/cardano/cnode/db
+read -r -p "Path [/opt/cardano/cnode/db]: " inputPath
+dbdir=${inputPath:-/opt/cardano/cnode/db}
 echo
 
 # Print the snapshot digest and the directory where it will be deployed
