@@ -50,18 +50,11 @@ echo $whi"Created At: $gre$created_at"
 compression_algorithm=$(echo $last_snapshot | jq -r '.compression_algorithm')
 echo $whi"Compression Algorithm: $gre$compression_algorithm"
 
-snapshot_cardano_node_version=$(echo $last_snapshot | jq -r '.cardano_node_version')
-echo $whi"Cardano Node Version in Snapshot: $gre$snapshot_cardano_node_version"
+cardano_node_version=$(echo $last_snapshot | jq -r '.cardano_node_version')
+echo $whi"Cardano Node Version: $gre$cardano_node_version"
 
-# Check the installed version of cardano-node
-if command -v cardano-node &> /dev/null
-then
-    installed_cardano_node_version=$(cardano-node --version | grep -oP 'cardano-node \K[^\s]+')
-    echo $whi"Installed Cardano Node Version: $gre$installed_cardano_node_version"
-else
-    echo $whi"Cardano Node is not installed on this system."
-    installed_cardano_node_version="not installed"
-fi
+downloadUrl=$(echo $last_snapshot | jq -r '.locations[]')
+echo $whi"Download Url: $gre$downloadUrl"
 
 # Print some warnings and information to the user
 echo
@@ -69,13 +62,12 @@ echo $whi"A highly compressed file will expand to roughly four times its size up
 echo
 echo $whi"Please ensure you've enough space to perform this operation."
 echo
-echo $whi"Paste your Cardano Blockchain DB Path: "
+echo $whi"Type or paste your Cardano blockchain db path, or hit enter for Guild Operators Koios Cntools default path of /opt/cardano/cnode/db: "
 echo
 
-# Get the path where the user wants to deploy the snapshot
-read -r inputPath
-
-dbdir=$inputPath
+# Get the path where the user wants to deploy the snapshot, default to /opt/cardano/cnode/db
+read -r -p "Path [/opt/cardano/cnode/db]: " inputPath
+dbdir=${inputPath:-/opt/cardano/cnode/db}
 echo
 
 # Print the snapshot digest and the directory where it will be deployed
@@ -83,12 +75,19 @@ echo $whi"Latest Mithril Snapshot $gre$digest"
 echo $whi"will be downloaded and deployed under directory: $gre$dbdir"
 echo $gre
 
-# Check if the 'pv' command is available, if not, skip the progress bar
+# Check if the 'pv' command is available, if not, install it
 if ! command -v pv &> /dev/null
 then
     echo "pv could not be found"
-    echo "Progress bar will be skipped..."
-    progress_cmd="cat"
+    echo "Installing pv..."
+    if [ -f /etc/debian_version ]; then
+        sudo apt-get update && sudo apt-get install -y pv
+    elif [ -f /etc/redhat-release ]; then
+        sudo yum update && sudo yum install -y pv
+    else
+        echo "Unsupported Linux distribution. Please install pv manually."
+        progress_cmd="cat"
+    fi
 else
     progress_cmd="pv"
 fi
