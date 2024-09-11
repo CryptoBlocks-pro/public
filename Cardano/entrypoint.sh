@@ -21,6 +21,7 @@ echo "NODE: $HOSTNAME - Port:$CNODE_PORT - $POOL_NAME";
 cardano-node --version;
 
 # Cryptoblocks.pro Modified the Guildcomminity version to use Azure Fileshare for backup and restore
+# Make aure ENABLE_RESTORE are set to Y in the Helm values.yaml file
 if [[ "${ENABLE_BACKUP}" == "Y" ]] || [[ "${ENABLE_RESTORE}" == "Y" ]]; then
   [[ ! -d "${CNODE_HOME}"/backup/$NETWORK-db ]] && mkdir -p $CNODE_HOME/backup/$NETWORK-db
   dbsize=$(du -s $CNODE_HOME/db | awk '{print $1}')
