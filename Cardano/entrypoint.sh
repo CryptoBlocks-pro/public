@@ -20,6 +20,9 @@ echo "ENTRYPOINT_PROCESS: $ENTRYPOINT_PROCESS"
 echo "NODE: $HOSTNAME - Port:$CNODE_PORT - $POOL_NAME";
 cardano-node --version;
 
+# Debugging
+echo "File permissions for /opt/cardano/cnode/files/config.json:" $(ls -l /opt/cardano/cnode/files/config.json)
+
 # Cryptoblocks.pro Modified the Guildcomminity version of this script to use Azure Fileshare for backup and restore
 # Make aure ENABLE_RESTORE are set to Y in the Helm values.yaml file
 if [[ "${ENABLE_BACKUP}" == "Y" ]] || [[ "${ENABLE_RESTORE}" == "Y" ]]; then
