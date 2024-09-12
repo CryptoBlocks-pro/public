@@ -28,7 +28,8 @@ if [[ "${ENABLE_BACKUP}" == "Y" ]] || [[ "${ENABLE_RESTORE}" == "Y" ]]; then
   bksizedb=$(du -s /mnt/${dbBootstrap.AzureFileshareName}/db 2>/dev/null | awk '{print $1}')
   if [[ "${ENABLE_RESTORE}" == "Y" ]] && [[ "$dbsize" -lt "$bksizedb" ]]; then
     echo "Restore Started"
-    cp -rf /mnt/${dbBootstrap.AzureFileshareName}/db/* "${CNODE_HOME}"/db 2>/dev/null
+    cp -rf /mnt/${dbBootstrap.AzureFileshareName}/db/* "${CNODE_HOME}"/db 2>/dev/null # Copy the db files from the Azure Fileshare to the db directory
+    cp -rf /mnt/${dbBootstrap.AzureFileshareName}/files/topology.json "${CNODE_HOME}"/files 2>/dev/null # Copy the topology.json file from the Azure Fileshare to the files directory
     echo "Restore Finished"
   fi
 
