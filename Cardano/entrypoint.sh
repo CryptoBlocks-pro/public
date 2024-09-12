@@ -62,6 +62,9 @@ load_configs () {
   cp -rf /conf/"${NETWORK}"/db-sync-config.json "$CNODE_HOME"/files/
 }
 
+# Create a file with the name of the pod in the /opt/cardano/cnode/files directory
+echo $HOSTNAME > /opt/cardano/cnode/files/$(HOSTNAME)
+
 if [[ -n "${NETWORK}" ]] ; then
   if [[ "${UPDATE_CHECK}" == "Y" ]] ; then
     "$CNODE_HOME"/scripts/guild-deploy.sh -n "$NETWORK" -u -s f > /dev/null 2>&1
