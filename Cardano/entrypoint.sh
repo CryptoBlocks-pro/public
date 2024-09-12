@@ -11,6 +11,8 @@ head -n 8 ~/.scripts/banner.txt
 
 [[ -z "${ENTRYPOINT_PROCESS}" ]] && export ENTRYPOINT_PROCESS=cnode.sh 
 
+# Debugging
+echo "testing, 1, 2, 3"
 echo "NETWORK: $NETWORK $POOL_NAME $TOPOLOGY"
 echo "ENTRYPOINT_PROCESS: $ENTRYPOINT_PROCESS"
 
