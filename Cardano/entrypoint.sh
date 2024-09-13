@@ -81,17 +81,21 @@ curl -s -o /opt/cardano/cnode/scripts/mithril-client.sh https://raw.githubuserco
 curl -s -o /opt/cardano/cnode/scripts/mithril-signer.sh https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/scripts/cnode-helper-scripts/mithril-signer.sh
 curl -s -o /opt/cardano/cnode/scripts/mithril-relay.sh https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/scripts/cnode-helper-scripts/mithril-relay.sh
 
+# Debugging: Check ownership before changing
+echo "Ownership before chown:"
+ls -l /opt/cardano/cnode/files/config.json
+
 # Set permissions and ownership
 sudo chown -R guild:guild /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 sudo chmod -R 755 /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 
+# Debugging: Check ownership after changing
+echo "Ownership after chown:"
+ls -l /opt/cardano/cnode/files/config.json
+
 # Create a file with the name of the pod in the /opt/cardano/cnode/files directory
 # touch /opt/cardano/cnode/files/${HOSTNAME}
-touch /opt/cardano/cnode/files/$(hostname)
-
-# Debugging
-echo "File permissions for /opt/cardano/cnode/files/config.json:" $(ls -l /opt/cardano/cnode/files/config.json)
-
+# touch /opt/cardano/cnode/files/$(hostname)
 
 if [[ -n "${NETWORK}" ]] ; then
   if [[ "${UPDATE_CHECK}" == "Y" ]] ; then
