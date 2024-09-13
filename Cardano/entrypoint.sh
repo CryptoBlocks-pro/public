@@ -22,9 +22,6 @@ echo "ENTRYPOINT_PROCESS: $ENTRYPOINT_PROCESS"
 echo "NODE: $HOSTNAME - Port:$CNODE_PORT - $POOL_NAME";
 cardano-node --version;
 
-# Debugging
-echo "File permissions for /opt/cardano/cnode/files/config.json:" $(ls -l /opt/cardano/cnode/files/config.json)
-
 # Cryptoblocks.pro Modified the Guildcomminity version of this script to use Azure Fileshare for backup and restore
 # Make aure ENABLE_RESTORE are set to Y in the Helm values.yaml file
 if [[ "${ENABLE_BACKUP}" == "Y" ]] || [[ "${ENABLE_RESTORE}" == "Y" ]]; then
@@ -89,7 +86,11 @@ chmod -R a+rx /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 chown -R guild:guild /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 
 # Create a file with the name of the pod in the /opt/cardano/cnode/files directory
-echo $HOSTNAME > /opt/cardano/cnode/files/$(hostname)
+touch /opt/cardano/cnode/files/$(hostname)
+
+# Debugging
+echo "File permissions for /opt/cardano/cnode/files/config.json:" $(ls -l /opt/cardano/cnode/files/config.json)
+
 
 if [[ -n "${NETWORK}" ]] ; then
   if [[ "${UPDATE_CHECK}" == "Y" ]] ; then
