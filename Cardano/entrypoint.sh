@@ -83,7 +83,7 @@ curl -s -o /opt/cardano/cnode/scripts/mithril-relay.sh https://raw.githubusercon
 
 # Set permissions and ownership
 sudo chown -R guild:guild /opt/cardano/cnode/files /opt/cardano/cnode/scripts
-sudo chmod -R a+rx /opt/cardano/cnode/files /opt/cardano/cnode/scripts
+sudo chmod -R 755 /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 
 # Create a file with the name of the pod in the /opt/cardano/cnode/files directory
 # touch /opt/cardano/cnode/files/${HOSTNAME}
