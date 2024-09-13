@@ -61,14 +61,35 @@ load_configs () {
     cp -rf /conf/"${NETWORK}"/topology.json "$CNODE_HOME"/files/
   fi
 
-  # Copy other configuration files
-  cp -rf /conf/"${NETWORK}"/{alonzo,byron,conway,shelley}-genesis.json "$CNODE_HOME"/files/
-  cp -rf /conf/"${NETWORK}"/config.json "$CNODE_HOME"/files/
-  cp -rf /conf/"${NETWORK}"/db-sync-config.json "$CNODE_HOME"/files/
-}
+#   # Copy other configuration files
+#   cp -rf /conf/"${NETWORK}"/{alonzo,byron,conway,shelley}-genesis.json "$CNODE_HOME"/files/
+#   cp -rf /conf/"${NETWORK}"/config.json "$CNODE_HOME"/files/
+#   cp -rf /conf/"${NETWORK}"/db-sync-config.json "$CNODE_HOME"/files/
+# }
+
+# Create necessary directories
+# mkdir -p /opt/cardano/cnode/files /opt/cardano/cnode/scripts
+
+# Download configuration files to /opt/cardano/cnode/files
+curl -s -o /opt/cardano/cnode/files/config.json https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/files/configs/${network}/config.json
+curl -s -o /opt/cardano/cnode/files/db-sync-config.json https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/files/configs/${network}/db-sync-config.json
+curl -s -o /opt/cardano/cnode/files/alonzo-genesis.json https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/files/configs/${network}/alonzo-genesis.json
+curl -s -o /opt/cardano/cnode/files/byron-genesis.json https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/files/configs/${network}/byron-genesis.json
+curl -s -o /opt/cardano/cnode/files/conway-genesis.json https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/files/configs/${network}/conway-genesis.json
+curl -s -o /opt/cardano/cnode/files/shelley-genesis.json https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/files/configs/${network}/shelley-genesis.json
+
+# Download scripts to /opt/cardano/cnode/scripts
+curl -s -o /opt/cardano/cnode/scripts/guild-deploy.sh https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/scripts/cnode-helper-scripts/guild-deploy.sh
+curl -s -o /opt/cardano/cnode/scripts/mithril-client.sh https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/scripts/cnode-helper-scripts/mithril-client.sh
+curl -s -o /opt/cardano/cnode/scripts/mithril-signer.sh https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/scripts/cnode-helper-scripts/mithril-signer.sh
+curl -s -o /opt/cardano/cnode/scripts/mithril-relay.sh https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/scripts/cnode-helper-scripts/mithril-relay.sh
+
+# Set permissions and ownership
+chmod -R a+rx /opt/cardano/cnode/files /opt/cardano/cnode/scripts
+chown -R guild:guild /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 
 # Create a file with the name of the pod in the /opt/cardano/cnode/files directory
-echo $HOSTNAME > /opt/cardano/cnode/files/$(HOSTNAME)
+echo $HOSTNAME > /opt/cardano/cnode/files/$(hostname)
 
 if [[ -n "${NETWORK}" ]] ; then
   if [[ "${UPDATE_CHECK}" == "Y" ]] ; then
