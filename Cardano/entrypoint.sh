@@ -19,7 +19,7 @@ echo "ENTRYPOINT_PROCESS: $ENTRYPOINT_PROCESS"
 [[ -z "${CNODE_HOME}" ]] && export CNODE_HOME=/opt/cardano/cnode 
 [[ -z "${CNODE_PORT}" ]] && export CNODE_PORT=6000
 
-echo "NODE: $HOSTNAME - Port:$CNODE_PORT - $POOL_NAME";
+echo "NODE: ${HOSTNAME} - Port:$CNODE_PORT - $POOL_NAME";
 cardano-node --version;
 
 # Cryptoblocks.pro Modified the Guildcomminity version of this script to use Azure Fileshare for backup and restore
@@ -82,11 +82,11 @@ curl -s -o /opt/cardano/cnode/scripts/mithril-signer.sh https://raw.githubuserco
 curl -s -o /opt/cardano/cnode/scripts/mithril-relay.sh https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/scripts/cnode-helper-scripts/mithril-relay.sh
 
 # Set permissions and ownership
-chmod -R a+rx /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 chown -R guild:guild /opt/cardano/cnode/files /opt/cardano/cnode/scripts
+chmod -R a+rx /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 
 # Create a file with the name of the pod in the /opt/cardano/cnode/files directory
-touch /opt/cardano/cnode/files/$(hostname)
+touch /opt/cardano/cnode/files/${HOSTNAME}
 
 # Debugging
 echo "File permissions for /opt/cardano/cnode/files/config.json:" $(ls -l /opt/cardano/cnode/files/config.json)
