@@ -62,10 +62,10 @@ load_configs () {
 #   cp -rf /conf/"${NETWORK}"/{alonzo,byron,conway,shelley}-genesis.json "$CNODE_HOME"/files/
 #   cp -rf /conf/"${NETWORK}"/config.json "$CNODE_HOME"/files/
 #   cp -rf /conf/"${NETWORK}"/db-sync-config.json "$CNODE_HOME"/files/
-# }
+ }
 
 # Create necessary directories
-# mkdir -p /opt/cardano/cnode/files /opt/cardano/cnode/scripts
+mkdir -p /opt/cardano/cnode/files /opt/cardano/cnode/scripts
 
 # Download configuration files to /opt/cardano/cnode/files
 curl -s -o /opt/cardano/cnode/files/config.json https://raw.githubusercontent.com/${G_ACCOUNT}/guild-operators/${GUILD_DEPLOY_BRANCH}/files/configs/${network}/config.json
