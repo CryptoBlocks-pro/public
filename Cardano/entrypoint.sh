@@ -58,11 +58,11 @@ load_configs () {
     cp -rf /conf/"${NETWORK}"/topology.json "$CNODE_HOME"/files/
   fi
 
-#   # Copy other configuration files
-#   cp -rf /conf/"${NETWORK}"/{alonzo,byron,conway,shelley}-genesis.json "$CNODE_HOME"/files/
-#   cp -rf /conf/"${NETWORK}"/config.json "$CNODE_HOME"/files/
-#   cp -rf /conf/"${NETWORK}"/db-sync-config.json "$CNODE_HOME"/files/
- }
+  # Copy other configuration files
+  # cp -rf /conf/"${NETWORK}"/{alonzo,byron,conway,shelley}-genesis.json "$CNODE_HOME"/files/
+  # cp -rf /conf/"${NETWORK}"/config.json "$CNODE_HOME"/files/
+  # cp -rf /conf/"${NETWORK}"/db-sync-config.json "$CNODE_HOME"/files/
+}
 
 # Create necessary directories
 mkdir -p /opt/cardano/cnode/files /opt/cardano/cnode/scripts
