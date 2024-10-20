@@ -8,6 +8,21 @@ The `ApexPrime-to-cntools.sh` script is designed to set up and configure an Apex
 
 This script converts a standard cntools Cardano install to the Apex Prime testnet. It can be used to create multiple instances running on the same server. For that use case, you will need to choose different ports for each instance you install.
 
+It can handle:
+- Installation of the folder and file structure for an Apex Prime node
+- Using `gLiveView` to view the Prime node running status
+- Creation of wallets, registration of wallets, etc. through cntools
+- Creation of pools, registration of pools, modification of pools through cntools
+- Rotation of KES keys
+- Sending funds through cntools
+- Running multiple instances on a server (mainly for testnet)
+- Running Apex Fusion Prime **testnet** not mainnet (it will need to be modified for mainnet)
+
+This is a bare-minimum implementation (MVP) to quickly install Apex Prime nodes onto a server. 
+- It does not handle any block leader logs
+- Some of the "list" commands show incorrect information
+- There may be other glitches
+
 This script will download all Apex Fusion Prime components directly from their GitHub repository. No need to pre-download anything.
 
 ## Prerequisites
