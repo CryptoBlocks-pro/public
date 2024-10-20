@@ -14,12 +14,12 @@ Before running this script, ensure you have the following:
 
 - Koios/cntools setup completed.
   See https://cardano-community.github.io/guild-operators/basics/ for usage. A recommended command to run is the following, noting that
-  `-p` is the parent folder in which the top level folder gets created
-  `-t` is the top-level folder to install the cntools instance into
-  `-b` is an alternate branch of cntools, for specified older cardano-node version compatibility.
-  `-s` is a selective install to control which components are installed
-  `-d` will download cardano-node and cardano-cli on amd64 systems (but not aarch64)
-  `-f` will force overwrite config files so that it's in the default state
+  - `-p` is the parent folder in which the top level folder gets created
+  - `-t` is the top-level folder to install the cntools instance into
+  - `-b` is an alternate branch of cntools, for specified older cardano-node version compatibility.
+  - `-s` is a selective install to control which components are installed
+  - `-d` will download cardano-node and cardano-cli on amd64 systems (but not aarch64)
+  - `-f` will force overwrite config files so that it's in the default state
   
   In this example we will install a cntools intance to /opt/apex/pool1 compatible with cardano-node 8.7.3
   
