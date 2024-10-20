@@ -8,6 +8,8 @@ The `ApexPrime-to-cntools.sh` script is designed to set up and configure an Apex
 
 This script converts a standard cntools Cardano install to the Apex Prime testnet. It can be used to create multiple instances running on the same server. For that use case, you will need to choose different ports for each instance you install.
 
+This script will download all Apex Fusion Prime components directly from their GitHub repository. No need to pre-download anything.
+
 ## Prerequisites
 
 Before running this script, ensure you have the following:
