@@ -11,10 +11,10 @@ This script converts a standard cntools Cardano install to the Apex Prime testne
 It can handle:
 - Installation of the folder and file structure for an Apex Prime node
 - Using `gLiveView` to view the Prime node running status
-- Creation of wallets, registration of wallets, etc. through cntools
-- Creation of pools, registration of pools, modification of pools through cntools
+- Creation of wallets, registration of wallets, etc. through `cntools`
+- Creation of pools, registration of pools, modification of pools through `cntools`
 - Rotation of KES keys
-- Sending funds through cntools
+- Sending funds through `cntools`
 - Running multiple instances on a server (mainly for testnet)
 - Running Apex Fusion Prime **testnet** not mainnet (it will need to be modified for mainnet)
 
