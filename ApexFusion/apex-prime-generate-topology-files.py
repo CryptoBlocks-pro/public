@@ -3,13 +3,14 @@ import json
 import os
 
 # This script generates topology.json files for each server in a CSV file. It generates the localRoots and publicRoots sections based on the role of the server.
-# The input file is defined in the Main function, server_list_file. The CSV file should have the following columns: friendly_name, address, port, role.
+# The input file is defined in the Main function, server_list_file. The CSV file should have the following columns: address,port,friendly_name,role.
 # The role can be either node or relay. For relay servers, extra entries are added to the publicRoots section.
 #sample text file content:
 #address,port,friendly_name,role
 #relay1.foo.com,5521,Main-relay1,relay
 #relay2.foo.com,5521,Main-relay2,relay
 #node1.foo.com,5521,Main-node1,node
+# save the file as apex-prime-servers.txt
 
 # Define the extra entries for relays; these only get added in relay toplogy files, and are put in the publicRoots section
 extra_relay_entries = [
