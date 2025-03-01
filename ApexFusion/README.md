@@ -54,6 +54,6 @@ The following will be installed if not present on the system:
 
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/yourusername/apexprime-to-cntools.git
+   git clone https://github.com/CryptoBlocks-pro/apexprime-to-cntools.git
    cd apexprime-to-cntools
    ./ApexPrime-to-cntools.sh  
