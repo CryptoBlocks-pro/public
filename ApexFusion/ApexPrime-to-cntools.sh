@@ -113,6 +113,18 @@ echo "Replaced CNODE_PORT in $APEX_TOP_LEVEL_FOLDER/scripts/env"
 sed -i "s|#CONFIG=\"\${CNODE_HOME}/files/config.json\"|CONFIG=\"${APEX_TOP_LEVEL_FOLDER}/files/configuration.json\"|g" "$APEX_TOP_LEVEL_FOLDER/scripts/env"
 echo "Replaced CONFIG in $APEX_TOP_LEVEL_FOLDER/scripts/env"
 
+sed -i "s/#STRICT_VERSION_CHECK=\"Y\"/STRICT_VERSION_CHECK=\"N\"/g" "$APEX_TOP_LEVEL_FOLDER/scripts/env"
+echo "Replaced STRICT_VERSION_CHECK in $APEX_TOP_LEVEL_FOLDER/scripts/env"
+
+sed -i "s/#UPDATE_CHECK=\"Y\"/UPDATE_CHECK=\"N\"/g" "$APEX_TOP_LEVEL_FOLDER/scripts/env"
+echo "Replaced UPDATE_CHECK in $APEX_TOP_LEVEL_FOLDER/scripts/env"
+
+# Extract the top-level folder name and convert to uppercase for POOL_NAME
+POOL_NAME=$(basename "$APEX_TOP_LEVEL_FOLDER" | tr '[:lower:]' '[:upper:]')
+sed -i "s/#POOL_NAME=\"\"/POOL_NAME=\"$POOL_NAME\"/g" "$APEX_TOP_LEVEL_FOLDER/scripts/env"
+echo "Set POOL_NAME to \"$POOL_NAME\" in $APEX_TOP_LEVEL_FOLDER/scripts/env"
+
+
 # Calculate EKG port
 ekg_port=$((prometheus_port - 1))
 
