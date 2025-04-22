@@ -60,7 +60,12 @@ customise () {
 }
 
 load_configs () {
-  cp -rf /conf/"${NETWORK}"/* "$CNODE_HOME"/files/
+  echo "Loading configs from /conf/${NETWORK}/ to ${CNODE_HOME}/files/"
+  ls -la /conf/${NETWORK}/
+  mkdir -p "${CNODE_HOME}/files/"
+  cp -rfv /conf/"${NETWORK}"/* "${CNODE_HOME}"/files/
+  echo "Config files after copy:"
+  ls -la "${CNODE_HOME}"/files/
 }
 
 if [[ -n "${NETWORK}" ]] ; then
