@@ -73,6 +73,7 @@ if [[ -n "${NETWORK}" ]] ; then
   else
     load_configs
   fi
+fi
 
 customise \
 && exec "$CNODE_HOME/scripts/$ENTRYPOINT_PROCESS" "$@"
