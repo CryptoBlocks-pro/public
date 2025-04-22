@@ -66,6 +66,16 @@ load_configs () {
   cp -rfv /conf/"${NETWORK}"/* "${CNODE_HOME}"/files/
   echo "Config files after copy:"
   ls -la "${CNODE_HOME}"/files/
+  
+  # Create symlink for compatibility with guild scripts
+  if [[ "$NETWORK" == "afpm" ]]; then
+    echo "Creating symlink for compatibility"
+    mkdir -p /opt/cardano/cnode/files
+    rm -rf /opt/cardano/cnode/files/*
+    ln -sfv "${CNODE_HOME}"/files/* /opt/cardano/cnode/files/
+    echo "Symlinks created:"
+    ls -la /opt/cardano/cnode/files/
+  fi
 }
 
 if [[ -n "${NETWORK}" ]] ; then
