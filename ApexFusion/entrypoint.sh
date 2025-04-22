@@ -72,12 +72,7 @@ if [[ -n "${NETWORK}" ]] ; then
     fi
   else
     load_configs
-  fi
-else
-  echo "Please set a NETWORK environment variable to one of: mainnet / preview / preprod / guild-mainnet / guild / afpm"
-  echo "mount a '$CNODE_HOME/priv/files' volume containing: mainnet-config.json, mainnet-shelley-genesis.json, mainnet-byron-genesis.json, and mainnet-topology.json "
-  echo "for active nodes set POOL_DIR environment variable where op.cert, hot.skey and vrf.skey files reside. (usually under '${CNODE_HOME}/priv/pool/$POOL_NAME' ) "
-  echo "or just set POOL_NAME environment variable (for default path). "
 fi
 
-customise
+customise \
+&& exec "$CNODE_HOME/scripts/$ENTRYPOINT_PROCESS" "$@"
