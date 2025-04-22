@@ -14,13 +14,7 @@ head -n 8 ~/.scripts/banner.txt
 echo "NETWORK: $NETWORK $POOL_NAME $TOPOLOGY"
 echo "ENTRYPOINT_PROCESS: $ENTRYPOINT_PROCESS"
 
-# Set CNODE_HOME based on the network
-if [[ "$NETWORK" == "afpm" ]]; then
-  [[ -z "${CNODE_HOME}" ]] && export CNODE_HOME=/opt/apex/prime
-else
-  [[ -z "${CNODE_HOME}" ]] && export CNODE_HOME=/opt/cardano/cnode
-fi
-
+[[ -z "${CNODE_HOME}" ]] && export CNODE_HOME=/opt/cardano/cnode
 [[ -z "${CNODE_PORT}" ]] && export CNODE_PORT=6000
 
 echo "NODE: $HOSTNAME - Port:$CNODE_PORT - $POOL_NAME";
@@ -45,49 +39,34 @@ fi
 
 # Customisation
 customise () {
-  if [[ "$NETWORK" == "afpm" ]]; then
-    find /opt/apex/prime/files -name "*config*.json" -print0 | xargs -0 sed -i 's/127.0.0.1/0.0.0.0/g' > /dev/null 2>&1
-    grep -i ENABLE_CHATTR /opt/apex/prime/scripts/cntools.sh >/dev/null && sed -E -i 's/^#?ENABLE_CHATTR=(true|false)?/ENABLE_CHATTR=false/g' /opt/apex/prime/scripts/cntools.sh > /dev/null 2>&1
-    grep -i ENABLE_DIALOG /opt/apex/prime/scripts/cntools.sh >/dev/null && sed -E -i 's/^#?ENABLE_DIALOG=(true|false)?/ENABLE_DIALOG=false/' /opt/apex/prime/scripts/cntools.sh > /dev/null 2>&1
-    find /opt/apex/prime/files -name "*config*.json" -print0 | xargs -0 sed -i 's/\"hasEKG\": 12788,/\"hasEKG\": [\n    \"0.0.0.0\",\n    12788\n],/g' > /dev/null 2>&1
-  else
-    find /opt/cardano/cnode/files -name "*config*.json" -print0 | xargs -0 sed -i 's/127.0.0.1/0.0.0.0/g' > /dev/null 2>&1
-    grep -i ENABLE_CHATTR /opt/cardano/cnode/scripts/cntools.sh >/dev/null && sed -E -i 's/^#?ENABLE_CHATTR=(true|false)?/ENABLE_CHATTR=false/g' /opt/cardano/cnode/scripts/cntools.sh > /dev/null 2>&1
-    grep -i ENABLE_DIALOG /opt/cardano/cnode/scripts/cntools.sh >/dev/null && sed -E -i 's/^#?ENABLE_DIALOG=(true|false)?/ENABLE_DIALOG=false/' /opt/cardano/cnode/scripts/cntools.sh > /dev/null 2>&1
-    find /opt/cardano/cnode/files -name "*config*.json" -print0 | xargs -0 sed -i 's/\"hasEKG\": 12788,/\"hasEKG\": [\n    \"0.0.0.0\",\n    12788\n],/g' > /dev/null 2>&1
-  fi
+  find /opt/cardano/cnode/files -name "*config*.json" -print0 | xargs -0 sed -i 's/127.0.0.1/0.0.0.0/g' > /dev/null 2>&1
+  grep -i ENABLE_CHATTR /opt/cardano/cnode/scripts/cntools.sh >/dev/null && sed -E -i 's/^#?ENABLE_CHATTR=(true|false)?/ENABLE_CHATTR=false/g' /opt/cardano/cnode/scripts/cntools.sh > /dev/null 2>&1
+  grep -i ENABLE_DIALOG /opt/cardano/cnode/scripts/cntools.sh >/dev/null && sed -E -i 's/^#?ENABLE_DIALOG=(true|false)?/ENABLE_DIALOG=false/' /opt/cardano/cnode/scripts/cntools.sh > /dev/null 2>&1
+  find /opt/cardano/cnode/files -name "*config*.json" -print0 | xargs -0 sed -i 's/\"hasEKG\": 12788,/\"hasEKG\": [\n    \"0.0.0.0\",\n    12788\n],/g' > /dev/null 2>&1
   return 0
 }
 
 load_configs () {
   echo "Loading configs from /conf/${NETWORK}/ to ${CNODE_HOME}/files/"
-  ls -la /conf/${NETWORK}/
   mkdir -p "${CNODE_HOME}/files/"
-  cp -rfv /conf/"${NETWORK}"/* "${CNODE_HOME}"/files/
-  echo "Config files after copy:"
-  ls -la "${CNODE_HOME}"/files/
-  
-  # Create symlink for compatibility with guild scripts
-  if [[ "$NETWORK" == "afpm" ]]; then
-    echo "Creating symlink for compatibility"
-    mkdir -p /opt/cardano/cnode/files
-    rm -rf /opt/cardano/cnode/files/*
-    ln -sfv "${CNODE_HOME}"/files/* /opt/cardano/cnode/files/
-    echo "Symlinks created:"
-    ls -la /opt/cardano/cnode/files/
-  fi
+  cp -rf /conf/"${NETWORK}"/* "${CNODE_HOME}"/files/
 }
 
 if [[ -n "${NETWORK}" ]] ; then
   if [[ "${UPDATE_CHECK}" == "Y" ]] ; then
     if [[ "$NETWORK" == "afpm" ]]; then
-      "$CNODE_HOME"/scripts/guild-deploy.sh -b main -n afpm -p /opt/apex/prime -t POOL -s f > /dev/null 2>&1
+      "$CNODE_HOME"/scripts/guild-deploy.sh -n afpm -u -s f > /dev/null 2>&1
     else
       "$CNODE_HOME"/scripts/guild-deploy.sh -n "$NETWORK" -u -s f > /dev/null 2>&1
     fi
   else
     load_configs
   fi
+else
+  echo "Please set a NETWORK environment variable to one of: mainnet / preview / preprod / guild-mainnet / guild / afpm"
+  echo "mount a '$CNODE_HOME/priv/files' volume containing: mainnet-config.json, mainnet-shelley-genesis.json, mainnet-byron-genesis.json, and mainnet-topology.json "
+  echo "for active nodes set POOL_DIR environment variable where op.cert, hot.skey and vrf.skey files reside. (usually under '${CNODE_HOME}/priv/pool/$POOL_NAME' ) "
+  echo "or just set POOL_NAME environment variable (for default path). "
 fi
 
 customise \
