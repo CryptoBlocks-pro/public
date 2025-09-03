@@ -107,8 +107,11 @@ then
     fi
 fi
 
+
+# Ensure the target directory exists
+mkdir -p "$dbdir"
 # Change to the directory where the snapshot will be deployed
-cd $dbdir
+cd "$dbdir"
 
 # Start a timer
 start_time=$(date "+%s")
@@ -117,13 +120,14 @@ start_time=$(date "+%s")
 echo $whi"Downloading and extracting snapshot"
 wget -qO- $downloadUrl | $progress_cmd | unzstd | tar -xv
 
+
 # Print the directory where the snapshot has been deployed
 echo
-echo $whi"Cardano Blockchain DB has been restored under: $gre$dbDir"
+echo $whi"Cardano Blockchain DB has been restored under: $gre$dbdir"
 echo $whi
 
 # List the files in the directory
-ls -l $dbDir
+ls -l "$dbdir"
 echo
 
 # Stop the timer and print the elapsed time
