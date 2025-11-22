@@ -21,13 +21,13 @@ echo
 snapshots="https://aggregator.release-mainnet.api.mithril.network/aggregator/artifact/snapshots"
 
 # Get the latest snapshot data in JSON format
-last_snapshot=$(curl -s $snapshots | jq -r .[0])
+last_snapshot=$(curl -s $snapshots | jq -r '.[0]')
 
 # Extract and print various pieces of information about the snapshot
 digest=$(echo $last_snapshot | jq -r '.digest')
 echo $whi"Snapshot Digest: $gre$digest"
 
-network=$(echo $last_snapshot | jq -r '.beacon.network')
+network=$(echo $last_snapshot | jq -r '.network // "unknown"')
 echo $whi"Network: $gre$network"
 
 epoch=$(echo $last_snapshot | jq -r '.beacon.epoch')
@@ -40,9 +40,12 @@ certificate_hash=$(echo $last_snapshot | jq -r '.certificate_hash')
 echo $whi"Certificate Hash: $gre$certificate_hash"
 
 size=$(echo $last_snapshot | jq -r '.size')
-size_gb=$((size / 1024 / 1024))
-size_gb_format=$(echo $size_gb | awk '{print substr($0, 1, length($0)-3) "." substr($0, length($0)-1)}')
-echo $whi"Size: $gre$size_gb_format""Gb"
+size_gb=$(awk -v bytes="$size" 'BEGIN {printf "%.2f", bytes/1024/1024/1024}')
+echo $whi"Size: $gre$size_gb""Gb"
+
+ancillary_size=$(echo $last_snapshot | jq -r '.ancillary_size // 0')
+ancillary_gb=$(awk -v bytes="$ancillary_size" 'BEGIN {printf "%.2f", bytes/1024/1024/1024}')
+echo $whi"Ancillary Size: $gre$ancillary_gb""Gb"
 
 created_at=$(echo $last_snapshot | jq -r '.created_at' | awk '{print substr($0, 1, length($0)-11)}')
 echo $whi"Created At: $gre$created_at"
@@ -53,8 +56,14 @@ echo $whi"Compression Algorithm: $gre$compression_algorithm"
 cardano_node_version=$(echo $last_snapshot | jq -r '.cardano_node_version')
 echo $whi"Cardano Node Version: $gre$cardano_node_version"
 
-downloadUrl=$(echo $last_snapshot | jq -r '.locations[]')
+downloadUrl=$(echo $last_snapshot | jq -r '.locations[0]')
+ancillaryUrl=$(echo $last_snapshot | jq -r '.ancillary_locations[0] // empty')
 echo $whi"Download Url: $gre$downloadUrl"
+if [ -n "$ancillaryUrl" ]; then
+    echo $whi"Ancillary Url: $gre$ancillaryUrl"
+else
+    echo $whi"Ancillary Url: ${gre}not provided"
+fi
 
 # Print some warnings and information to the user
 echo
@@ -75,18 +84,20 @@ echo $whi"Latest Mithril Snapshot $gre$digest"
 echo $whi"will be downloaded and deployed under directory: $gre$dbdir"
 echo $gre
 
+# Default progress passthrough in case pv is missing
+progress_cmd="cat"
+
 # Check if the 'pv' command is available, if not, install it
 if ! command -v pv &> /dev/null
 then
     echo "pv could not be found"
     echo "Installing pv..."
     if [ -f /etc/debian_version ]; then
-        sudo apt-get update && sudo apt-get install -y pv
+        sudo apt-get update && sudo apt-get install -y pv && progress_cmd="pv"
     elif [ -f /etc/redhat-release ]; then
-        sudo yum update && sudo yum install -y pv
+        sudo yum update && sudo yum install -y pv && progress_cmd="pv"
     else
         echo "Unsupported Linux distribution. Please install pv manually."
-        progress_cmd="cat"
     fi
 else
     progress_cmd="pv"
@@ -113,12 +124,43 @@ mkdir -p "$dbdir"
 # Change to the directory where the snapshot will be deployed
 cd "$dbdir"
 
+# Offer to wipe existing data so ledger/volatile stay in sync with the snapshot
+if [ "$(ls -A "$dbdir")" ]; then
+    echo "${whi}Directory ${gre}${dbdir} ${whi}is not empty."
+    read -r -p "Remove existing immutable/ledger/volatile data before continuing? [y/N]: " confirm_wipe
+    if [[ "$confirm_wipe" =~ ^[Yy]$ ]]; then
+        echo $whi"Removing database directories restored by Mithril"
+        for path in immutable ledger volatile ancillary_manifest.json; do
+            if [ -e "$dbdir/$path" ]; then
+                rm -rf "$dbdir/$path"
+            fi
+        done
+    else
+        echo "Aborting to avoid mixing snapshots."
+        exit 1
+    fi
+fi
+
 # Start a timer
 start_time=$(date "+%s")
 
 # Download the snapshot, show a progress bar, extract the snapshot, and unpack it
-echo $whi"Downloading and extracting snapshot"
-wget -qO- $downloadUrl | $progress_cmd | unzstd | tar -xv
+if [ -z "$downloadUrl" ]; then
+    echo "Snapshot download URL missing."
+    exit 1
+fi
+
+echo $whi"Downloading and extracting immutable files"
+wget -qO- "$downloadUrl" | $progress_cmd | unzstd | tar -x --no-same-owner -f -
+
+if [ -n "$ancillaryUrl" ]; then
+    echo
+    echo $whi"Downloading and extracting ancillary data (ledger/volatile)"
+    wget -qO- "$ancillaryUrl" | $progress_cmd | unzstd | tar -x --no-same-owner -f -
+else
+    echo
+    echo $whi"No ancillary archive announced; the node will rebuild ledger/volatile locally."
+fi
 
 
 # Print the directory where the snapshot has been deployed
