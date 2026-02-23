@@ -1,4 +1,31 @@
 #!/usr/bin/env bash
+# Azure Spot eviction watcher installer.
+#
+# Purpose:
+# - Installs a small Python watcher that polls Azure Instance Metadata Service
+#   for scheduled Spot VM eviction events and gracefully stops a Cardano service
+#   when eviction is imminent.
+# - Creates and enables a systemd service to keep the watcher running.
+#
+# How it works:
+# - Ensures Python is installed, writes the watcher to the target user's home
+#   directory, and sets ownership/permissions.
+# - Creates /etc/systemd/system/azure-spot-eviction-watcher.service to run the
+#   watcher on boot with automatic restarts.
+# - The watcher polls IMDS every few seconds and logs warnings to syslog when
+#   a Preempt event is Scheduled or InProgress, then issues a systemd stop for
+#   the configured Cardano service.
+#
+# Verify it's working (journalctl):
+# - Follow live logs:
+#     journalctl -u azure-spot-eviction-watcher.service -f
+# - Recent logs since boot:
+#     journalctl -u azure-spot-eviction-watcher.service -b
+# - Last 100 lines:
+#     journalctl -u azure-spot-eviction-watcher.service -n 100 --no-pager
+# - Service status summary:
+#     systemctl status --no-pager azure-spot-eviction-watcher.service
+
 set -euo pipefail
 
 SERVICE_NAME="azure-spot-eviction-watcher"
