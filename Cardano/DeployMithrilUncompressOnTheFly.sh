@@ -5,6 +5,24 @@
 # It is based on the excellent script found at https://github.com/asnakep/Mithril-Snapshot-Deployer/releases/tag/v1.0.0
 # It mainly differs by uncompressed the snapshot on the fly, saving disk space and time, wihtout the need to store the compressed file.
 
+# --- Parse arguments ---------------------------------------------------------
+DB_PATH=""
+AUTO_YES=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --path)  DB_PATH="$2"; shift 2 ;;
+    --yes|-y) AUTO_YES=true; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--path <db-dir>] [--yes|-y]"
+      echo "  --path <dir>  Set db directory (default: /opt/cardano/cnode/db)"
+      echo "  --yes, -y     Auto-confirm wipe of existing data"
+      exit 0
+      ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
+  esac
+done
+
 # Define color codes for output
 export whi=`printf "\033[1;37m"`
 export gre=`printf "\033[1;36m"`
@@ -71,12 +89,15 @@ echo $whi"A highly compressed file will expand to roughly four times its size up
 echo
 echo $whi"Please ensure you've enough space to perform this operation."
 echo
-echo $whi"Type or paste your Cardano blockchain db path, or hit enter for Guild Operators Koios Cntools default path of /opt/cardano/cnode/db: "
-echo
-
 # Get the path where the user wants to deploy the snapshot, default to /opt/cardano/cnode/db
-read -r -p "Path [/opt/cardano/cnode/db]: " inputPath
-dbdir=${inputPath:-/opt/cardano/cnode/db}
+if [ -n "$DB_PATH" ]; then
+    dbdir="$DB_PATH"
+else
+    echo $whi"Type or paste your Cardano blockchain db path, or hit enter for Guild Operators Koios Cntools default path of /opt/cardano/cnode/db: "
+    echo
+    read -r -p "Path [/opt/cardano/cnode/db]: " inputPath
+    dbdir=${inputPath:-/opt/cardano/cnode/db}
+fi
 echo
 
 # Print the snapshot digest and the directory where it will be deployed
@@ -127,7 +148,11 @@ cd "$dbdir"
 # Offer to wipe existing data so ledger/volatile stay in sync with the snapshot
 if [ "$(ls -A "$dbdir")" ]; then
     echo "${whi}Directory ${gre}${dbdir} ${whi}is not empty."
-    read -r -p "Remove existing immutable/ledger/volatile data before continuing? [y/N]: " confirm_wipe
+    if $AUTO_YES; then
+        confirm_wipe="y"
+    else
+        read -r -p "Remove existing immutable/ledger/volatile data before continuing? [y/N]: " confirm_wipe
+    fi
     if [[ "$confirm_wipe" =~ ^[Yy]$ ]]; then
         echo $whi"Removing database directories restored by Mithril"
         for path in immutable ledger volatile ancillary_manifest.json; do
@@ -160,6 +185,14 @@ if [ -n "$ancillaryUrl" ]; then
 else
     echo
     echo $whi"No ancillary archive announced; the node will rebuild ledger/volatile locally."
+fi
+
+# Create the protocolMagicId marker file required by cardano-node
+if [ "$network" = "mainnet" ]; then
+    echo -n 764824073 > "$dbdir/protocolMagicId"
+    echo $whi"Created protocolMagicId marker (mainnet: 764824073)"
+else
+    echo $whi"${YELLOW:-}[WARN] Non-mainnet network '$network' — you may need to create protocolMagicId manually"
 fi
 
 
