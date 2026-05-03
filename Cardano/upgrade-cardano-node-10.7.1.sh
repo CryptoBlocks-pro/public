@@ -53,11 +53,12 @@ esac
 PROM_BIND="0.0.0.0"
 PROM_PORT="12798"
 EKG_PORT="12788"
-LEDGER_BACKEND="V2LSM"  # V2InMemory or V2LSM
+LEDGER_BACKEND="${LEDGER_BACKEND:-ask}"  # ask, V2InMemory or V2LSM
 SNAPSHOT_SAFETY_GB="${SNAPSHOT_SAFETY_GB:-20}"
 MITHRIL_CLIENT_BIN="${MITHRIL_CLIENT_BIN:-${BIN_DIR}/mithril-client}"
 MITHRIL_RELEASE_TAG="${MITHRIL_RELEASE_TAG:-latest}"
 MITHRIL_SIGNING_FPR="${MITHRIL_SIGNING_FPR:-73FC4C3DFD55DBDC428AD2B5BE043B79FDA4C2EE}"
+DB_HANDLING_MODE="${DB_HANDLING_MODE:-ask}"
 
 # --- Color helpers -----------------------------------------------------------
 RED='\033[0;31m'
@@ -74,7 +75,7 @@ bytes_to_gib() {
 }
 
 check_snapshot_disk_space() {
-  local target_path avail_bytes db_size_bytes required_bytes safety_bytes
+  local target_path avail_bytes db_size_bytes required_bytes safety_bytes est_avail_after_cleanup
   target_path="$(dirname "${DB_DIR}")"
   safety_bytes=$((SNAPSHOT_SAFETY_GB * 1024 * 1024 * 1024))
   avail_bytes=$(df -B1 --output=avail "${target_path}" 2>/dev/null | tail -1 | tr -d ' ')
@@ -87,15 +88,122 @@ check_snapshot_disk_space() {
     db_size_bytes=0
   fi
 
-  required_bytes=$((db_size_bytes + safety_bytes))
-
   info "Disk preflight (target: ${target_path})"
+  info "  DB handling mode: ${DB_HANDLING_MODE}"
   info "  Available: $(bytes_to_gib "${avail_bytes}") GiB"
-  info "  Estimated required for snapshot + buffer: $(bytes_to_gib "${required_bytes}") GiB"
 
-  if (( avail_bytes < required_bytes )); then
-    error "Insufficient free space for snapshot deploy. Need at least $(bytes_to_gib "${required_bytes}") GiB free (current DB size + ${SNAPSHOT_SAFETY_GB} GiB buffer), but only $(bytes_to_gib "${avail_bytes}") GiB is available."
+  case "${DB_HANDLING_MODE}" in
+    backup)
+      required_bytes=$((db_size_bytes + safety_bytes))
+      info "  Estimated required to keep backup + new DB buffer: $(bytes_to_gib "${required_bytes}") GiB"
+      if (( avail_bytes < required_bytes )); then
+        warn "Free space is below the estimate needed to keep full backup + growing production DB."
+        warn "You can continue, but may need to manually remove old backup DB before new DB grows too large."
+      fi
+      ;;
+    overwrite)
+      est_avail_after_cleanup=$((avail_bytes + db_size_bytes))
+      required_bytes=${safety_bytes}
+      info "  Estimated available after overwrite cleanup: $(bytes_to_gib "${est_avail_after_cleanup}") GiB"
+      info "  Estimated required for snapshot + buffer: $(bytes_to_gib "${required_bytes}") GiB"
+      if (( est_avail_after_cleanup < required_bytes )); then
+        error "Insufficient free space even after overwrite cleanup. Need at least $(bytes_to_gib "${required_bytes}") GiB free after DB removal, but estimate is $(bytes_to_gib "${est_avail_after_cleanup}") GiB."
+      fi
+      ;;
+    *)
+      error "Unsupported DB_HANDLING_MODE in disk check: ${DB_HANDLING_MODE}"
+      ;;
+  esac
+}
+
+select_db_handling_mode() {
+  local choice
+  case "${DB_HANDLING_MODE}" in
+    backup|overwrite)
+      ;;
+    ask|"")
+      if [[ -t 0 ]]; then
+        echo
+        echo "Choose how to handle existing DB directory (${DB_DIR}):"
+        echo "  1) backup    - move current DB aside before snapshot restore"
+        echo "  2) overwrite - delete current DB before snapshot restore"
+        read -r -p "Selection [1/2] (default 1): " choice
+        case "${choice}" in
+          ""|1|b|B|backup) DB_HANDLING_MODE="backup" ;;
+          2|o|O|overwrite) DB_HANDLING_MODE="overwrite" ;;
+          *) error "Invalid selection: ${choice}" ;;
+        esac
+      else
+        warn "Non-interactive shell and DB_HANDLING_MODE not set; defaulting to backup"
+        DB_HANDLING_MODE="backup"
+      fi
+      ;;
+    *)
+      error "Invalid DB_HANDLING_MODE='${DB_HANDLING_MODE}'. Use: ask, backup, overwrite"
+      ;;
+  esac
+
+  info "DB handling mode selected: ${DB_HANDLING_MODE}"
+}
+
+select_ledger_backend() {
+  local choice
+
+  case "${LEDGER_BACKEND}" in
+    V2InMemory|V2LSM)
+      ;;
+    ask|"")
+      if [[ -t 0 ]]; then
+        echo
+        echo "Choose LedgerDB backend:"
+        echo "  1) V2InMemory (default) - lower disk usage, replay from genesis"
+        echo "  2) V2LSM              - on-disk ledger snapshot backend"
+        read -r -p "Selection [1/2] (default 1): " choice
+        case "${choice}" in
+          ""|1|i|I|inmemory|V2InMemory) LEDGER_BACKEND="V2InMemory" ;;
+          2|l|L|lsm|V2LSM) LEDGER_BACKEND="V2LSM" ;;
+          *) error "Invalid LedgerDB backend selection: ${choice}" ;;
+        esac
+      else
+        warn "Non-interactive shell and LEDGER_BACKEND not set; defaulting to V2InMemory"
+        LEDGER_BACKEND="V2InMemory"
+      fi
+      ;;
+    *)
+      error "Invalid LEDGER_BACKEND='${LEDGER_BACKEND}'. Use: ask, V2InMemory, V2LSM"
+      ;;
+  esac
+
+  info "LedgerDB backend selected: ${LEDGER_BACKEND}"
+}
+
+prepare_db_directory_for_snapshot() {
+  local backup_base backup_target
+
+  if [[ ! -d "${DB_DIR}" ]]; then
+    warn "No database directory found at ${DB_DIR}"
+    return 0
   fi
+
+  case "${DB_HANDLING_MODE}" in
+    backup)
+      backup_base="${DB_DIR}-${CURRENT_VERSION}-bak"
+      backup_target="${backup_base}"
+      if [[ -e "${backup_target}" ]]; then
+        backup_target="${backup_base}-$(date +%s)"
+        warn "Default backup path exists, using ${backup_target}"
+      fi
+      mv "${DB_DIR}" "${backup_target}"
+      info "DB moved to backup path ${backup_target}"
+      ;;
+    overwrite)
+      rm -rf "${DB_DIR}"
+      info "Deleted existing DB directory ${DB_DIR}"
+      ;;
+    *)
+      error "Unsupported DB_HANDLING_MODE in DB prepare: ${DB_HANDLING_MODE}"
+      ;;
+  esac
 }
 
 ensure_protocol_magic_id() {
@@ -276,8 +384,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 info "Node role: ${NODE_ROLE}"
-info "LedgerDB backend: ${LEDGER_BACKEND}"
 ${DRY_RUN} && info "DRY RUN — no changes will be made"
+select_ledger_backend
+select_db_handling_mode
 
 # --- Step 0: Download staged binaries ----------------------------------------
 info "Step 0: Downloading cardano-node ${EXPECTED_NODE_VERSION} binaries..."
@@ -467,19 +576,8 @@ fi
 info "Binaries installed: cardano-node ${INSTALLED_VERSION} ✓"
 
 # --- Step 8: Rename old DB and deploy Mithril snapshot -----------------------
-info "Step 8: Renaming old database and deploying Mithril snapshot..."
-if [[ -d "${DB_DIR}" ]]; then
-  DB_BACKUP="${DB_DIR}-${CURRENT_VERSION}-bak"
-  if [[ -d "${DB_BACKUP}" ]]; then
-    warn "DB backup already exists: ${DB_BACKUP} — removing current DB"
-    rm -rf "${DB_DIR}"
-  else
-    mv "${DB_DIR}" "${DB_BACKUP}"
-    info "DB renamed to ${DB_BACKUP}"
-  fi
-else
-  warn "No database directory found at ${DB_DIR}"
-fi
+info "Step 8: Preparing database path and deploying Mithril snapshot..."
+prepare_db_directory_for_snapshot
 
 MITHRIL_SCRIPT="${HOME}/DeployMithrilUncompressOnTheFly.sh"
 MITHRIL_SCRIPT_URL="https://raw.githubusercontent.com/CryptoBlocks-pro/public/main/Cardano/DeployMithrilUncompressOnTheFly.sh"
@@ -548,7 +646,7 @@ info "Step 10: Validating..."
 sleep 5
 PROM_RESPONSE=$(curl -sf "http://localhost:${PROM_PORT}/metrics" 2>/dev/null | head -5) || true
 if [[ -n "${PROM_RESPONSE}" ]]; then
-  METRICS_VERSION=$(curl -sf "http://localhost:${PROM_PORT}/metrics" | grep 'cardano_node_metrics_cardano_build_info' | grep -oP 'version="[^"]+' | cut -d'"' -f2) || true
+  METRICS_VERSION=$(curl -sf "http://localhost:${PROM_PORT}/metrics" | grep 'cardano_node_metrics_cardano_build_info' | tr -d '\n' | grep -oP 'version="[^"]+' | cut -d'"' -f2) || true
   if [[ "${METRICS_VERSION}" == "${EXPECTED_NODE_VERSION}" ]]; then
     info "Prometheus metrics serving version ${METRICS_VERSION} ✓"
   else
