@@ -404,6 +404,14 @@ else
 fi
 info "Staged binaries ready in ${STAGED_BIN_DIR} ✓"
 
+  # Some release tarballs unpack under ./bin/, which leaves a nested bin/
+  # directory after extraction. Flatten that layout into STAGED_BIN_DIR.
+  if [[ ! -x "${STAGED_BIN_DIR}/cardano-node" && -x "${STAGED_BIN_DIR}/bin/cardano-node" ]]; then
+    info "Detected nested staged bin directory, flattening..."
+    mv "${STAGED_BIN_DIR}/bin"/* "${STAGED_BIN_DIR}/"
+    rmdir "${STAGED_BIN_DIR}/bin" 2>/dev/null || true
+  fi
+
 # --- Pre-flight checks -------------------------------------------------------
 [[ -d "${STAGED_BIN_DIR}" ]] || error "Staged binaries not found at ${STAGED_BIN_DIR}"
 [[ -x "${STAGED_BIN_DIR}/cardano-node" ]] || error "No cardano-node binary in ${STAGED_BIN_DIR}"
@@ -567,7 +575,14 @@ check_snapshot_disk_space
 
 # --- Step 7: Copy new binaries -----------------------------------------------
 info "Step 7: Installing new binaries..."
-cp "${STAGED_BIN_DIR}"/* "${BIN_DIR}/"
+mkdir -p "${BIN_DIR}"
+installed_count=0
+for src in "${STAGED_BIN_DIR}"/*; do
+  [[ -f "${src}" && -x "${src}" ]] || continue
+  cp "${src}" "${BIN_DIR}/"
+  installed_count=$((installed_count + 1))
+done
+[[ "${installed_count}" -gt 0 ]] || error "No executable binaries found in ${STAGED_BIN_DIR}"
 
 INSTALLED_VERSION=$("${BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
 if [[ "${INSTALLED_VERSION}" != "${EXPECTED_NODE_VERSION}" ]]; then
