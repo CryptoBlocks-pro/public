@@ -2,10 +2,12 @@
 set -euo pipefail
 
 ###############################################################################
-# Cardano Node Upgrade Script: → 10.7.1
+# Cardano Node Upgrade Script (multi-version, multi-arch)
 #
-# Upgrades a Guild Operators (Koios/CNTools) managed cardano-node from
-# 10.x to 10.7.1. Handles:
+# Upgrades a Guild Operators (Koios/CNTools) managed cardano-node.
+# Handles:
+#   - Automatic latest version detection from GitHub
+#   - Multi-architecture support (x86_64 / aarch64)
 #   - System dependency installation
 #   - Config/binary/DB backup
 #   - Official config.json download + edits
@@ -13,19 +15,24 @@ set -euo pipefail
 #   - Binary swap and service restart
 #
 # Usage:
-#   ./upgrade-cardano-node-10.7.1.sh [--relay|--bp]
+#   ./upgrade-cardano-node.sh [--version X.Y.Z] [--relay|--bp] [--dry-run]
+#   ./upgrade-cardano-node.sh                          # auto-detect latest
+#   ./upgrade-cardano-node.sh --version 11.0.1 --bp
+#   ./upgrade-cardano-node.sh --url https://... --version 10.7.1
 #
 # Flags:
-#   --relay   Include OpenBlockPerf traces (default)
-#   --bp      Block producer config (skip OpenBlockPerf traces)
-#   --dry-run Show what would be done without making changes
+#   --version  Target version (default: latest GitHub release)
+#   --url      Custom binary download URL (overrides auto-detected URL)
+#   --relay    Include OpenBlockPerf traces (default)
+#   --bp       Block producer config (skip OpenBlockPerf traces)
+#   --dry-run  Show what would be done without making changes
 #
 # Prerequisites:
-#   - New binaries staged in ~/tmp/bin/
 #   - Run as the node's service user (e.g. stakeman)
 #   - sudo access for systemctl and apt-get
+#   - curl and python3 available
 #
-# Tested: 10.6.2 → 10.7.1 on Ubuntu 24.04 (Azure)
+# Tested: 10.6.2 → 10.7.1, 10.7.1 → 11.0.1 on Ubuntu 24.04 (Azure)
 ###############################################################################
 
 # --- Configuration -----------------------------------------------------------
@@ -37,18 +44,12 @@ STAGED_BIN_DIR="${HOME}/tmp/bin"
 BACKUP_BIN_DIR="${HOME}/tmp/backup-bin"
 SERVICE_NAME="cnode.service"
 
-EXPECTED_NODE_VERSION="10.7.1"
+GITHUB_REPO="IntersectMBO/cardano-node"
+GITHUB_API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 
 CONFIG_URL="https://book.play.dev.cardano.org/environments/mainnet/config.json"
 CONWAY_GENESIS_URL="https://book.play.dev.cardano.org/environments/mainnet/conway-genesis.json"
 CHECKPOINTS_URL="https://book.play.dev.cardano.org/environments/mainnet/checkpoints.json"
-
-ARCH=$(uname -m)
-case "${ARCH}" in
-  x86_64)  NODE_RELEASE_URL="https://github.com/IntersectMBO/cardano-node/releases/download/${EXPECTED_NODE_VERSION}/cardano-node-${EXPECTED_NODE_VERSION}-linux-amd64.tar.gz" ;;
-  aarch64) NODE_RELEASE_URL="https://github.com/armada-alliance/cardano-node-binaries/raw/main/static-binaries/cardano-10_7_1-aarch64-static-musl-ghc_9122.tar.zst" ;;
-  *)       error "Unsupported architecture: ${ARCH}" ;;
-esac
 
 PROM_BIND="0.0.0.0"
 PROM_PORT="12798"
@@ -58,6 +59,7 @@ EKG_PORT="12788"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
@@ -67,17 +69,89 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 # --- Parse arguments ---------------------------------------------------------
 NODE_ROLE="relay"
 DRY_RUN=false
+TARGET_VERSION=""
+CUSTOM_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --version)
+      [[ $# -ge 2 ]] || error "--version requires a value (e.g. --version 11.0.1)"
+      TARGET_VERSION="$2"; shift 2 ;;
+    --url)
+      [[ $# -ge 2 ]] || error "--url requires a value"
+      CUSTOM_URL="$2"; shift 2 ;;
     --relay)   NODE_ROLE="relay"; shift ;;
     --bp)      NODE_ROLE="bp"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
-    *)         error "Unknown argument: $1" ;;
+    *)         error "Unknown argument: $1\nUsage: $0 [--version X.Y.Z] [--url URL] [--relay|--bp] [--dry-run]" ;;
   esac
 done
 
-info "Node role: ${NODE_ROLE}"
+# --- Resolve target version --------------------------------------------------
+if [[ -z "${TARGET_VERSION}" ]]; then
+  info "No --version specified. Detecting latest release from GitHub..."
+
+  LATEST=$(curl -sf "${GITHUB_API_URL}" 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null) || LATEST=""
+
+  if [[ -n "${LATEST}" ]]; then
+    echo ""
+    echo -e "  ${CYAN}Latest GitHub release: ${LATEST}${NC}"
+    echo ""
+    read -r -p "Upgrade to ${LATEST}? [Y/n]: " confirm
+    case "${confirm}" in
+      [nN]*)
+        read -r -p "Enter target version (e.g. 11.0.1): " TARGET_VERSION
+        [[ -z "${TARGET_VERSION}" ]] && error "No version specified"
+        ;;
+      *)
+        TARGET_VERSION="${LATEST}"
+        ;;
+    esac
+  else
+    warn "Could not detect latest version from GitHub API"
+    # Fallback: try to detect from currently installed binary
+    if [[ -x "${BIN_DIR}/cardano-node" ]]; then
+      INSTALLED=$("${BIN_DIR}/cardano-node" --version 2>/dev/null | head -1 | awk '{print $2}') || INSTALLED=""
+      if [[ -n "${INSTALLED}" ]]; then
+        warn "Currently installed version: ${INSTALLED}"
+      fi
+    fi
+    echo ""
+    read -r -p "Enter target version (e.g. 11.0.1): " TARGET_VERSION
+    [[ -z "${TARGET_VERSION}" ]] && error "No version specified. Use: $0 --version X.Y.Z"
+  fi
+fi
+
+# Basic version format validation
+if ! [[ "${TARGET_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  error "Invalid version format '${TARGET_VERSION}'. Expected X.Y.Z (e.g. 11.0.1)"
+fi
+
+info "Target version: ${TARGET_VERSION}"
+info "Node role:      ${NODE_ROLE}"
+
+# --- Resolve download URL and architecture -----------------------------------
+ARCH=$(uname -m)
+if [[ -n "${CUSTOM_URL}" ]]; then
+  NODE_RELEASE_URL="${CUSTOM_URL}"
+  info "Architecture:   ${ARCH}"
+  info "Download URL:   ${NODE_RELEASE_URL} (custom)"
+else
+  case "${ARCH}" in
+    x86_64)
+      NODE_RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${TARGET_VERSION}/cardano-node-${TARGET_VERSION}-linux-amd64.tar.gz"
+      ;;
+    aarch64)
+      NODE_RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${TARGET_VERSION}/cardano-node-${TARGET_VERSION}-linux-arm64.tar.gz"
+      ;;
+    *)
+      error "Unsupported architecture: ${ARCH}. Use --url to provide a custom binary URL."
+      ;;
+  esac
+  info "Architecture:   ${ARCH}"
+  info "Download URL:   ${NODE_RELEASE_URL}"
+fi
 
 # --- Choose LedgerDB backend -------------------------------------------------
 echo ""
@@ -97,19 +171,67 @@ info "LedgerDB backend: ${LEDGER_BACKEND}"
 ${DRY_RUN} && info "DRY RUN — no changes will be made"
 
 # --- Step 0: Download staged binaries ----------------------------------------
-info "Step 0: Downloading cardano-node ${EXPECTED_NODE_VERSION} binaries..."
+info "Step 0: Downloading cardano-node ${TARGET_VERSION} binaries..."
 mkdir -p "${STAGED_BIN_DIR}"
+
+# Check if binaries already downloaded at the correct version
+SKIP_DOWNLOAD=false
 if [[ -x "${STAGED_BIN_DIR}/cardano-node" ]]; then
   EXISTING_VER=$("${STAGED_BIN_DIR}/cardano-node" --version 2>/dev/null | head -1 | awk '{print $2}') || EXISTING_VER="unknown"
-  if [[ "${EXISTING_VER}" == "${EXPECTED_NODE_VERSION}" ]]; then
-    info "Binaries already downloaded (${EXISTING_VER}) — skipping download"
+  if [[ "${EXISTING_VER}" == "${TARGET_VERSION}" ]]; then
+    info "Binaries already staged (${EXISTING_VER}) — skipping download"
+    SKIP_DOWNLOAD=true
   else
-    info "Existing binaries are ${EXISTING_VER}, downloading ${EXPECTED_NODE_VERSION}..."
-    wget -c "${NODE_RELEASE_URL}" -O - | tar -I zstd -xv -C "${STAGED_BIN_DIR}" --strip-components=1
+    info "Staged binaries are ${EXISTING_VER}, need ${TARGET_VERSION} — re-downloading..."
   fi
-else
-  wget -c "${NODE_RELEASE_URL}" -O - | tar -I zstd -xv -C "${STAGED_BIN_DIR}" --strip-components=1
 fi
+
+if ! ${SKIP_DOWNLOAD}; then
+  DOWNLOAD_FILE=$(mktemp /tmp/cardano-node-XXXXXX)
+  trap 'rm -f "${DOWNLOAD_FILE}"' EXIT
+
+  # Verify URL is reachable before downloading
+  HTTP_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L "${NODE_RELEASE_URL}" 2>/dev/null) || HTTP_CODE="000"
+  if [[ "${HTTP_CODE}" != "200" && "${HTTP_CODE}" != "302" ]]; then
+    error "Download URL returned HTTP ${HTTP_CODE}. Verify the version/arch exists:\n  ${NODE_RELEASE_URL}\n\nFor older ARM64 releases, you may need --url with a custom binary (e.g. Armada Alliance)."
+  fi
+
+  info "Downloading..."
+  curl -L --fail --progress-bar "${NODE_RELEASE_URL}" -o "${DOWNLOAD_FILE}" \
+    || error "Download failed from ${NODE_RELEASE_URL}"
+
+  # Clear staged directory for clean extraction
+  rm -rf "${STAGED_BIN_DIR:?}"/*
+
+  # Auto-detect compression format and extract
+  _extract() {
+    local file="$1" dest="$2"
+    case "${NODE_RELEASE_URL}" in
+      *.tar.zst)
+        tar -I zstd -xf "${file}" -C "${dest}" --strip-components=1 ;;
+      *.tar.gz|*.tgz)
+        tar xzf "${file}" -C "${dest}" --strip-components=1 ;;
+      *.tar.xz)
+        tar xJf "${file}" -C "${dest}" --strip-components=1 ;;
+      *)
+        # Fallback: detect from file magic
+        local ftype
+        ftype=$(file -b "${file}" 2>/dev/null || echo "unknown")
+        case "${ftype}" in
+          *gzip*)      tar xzf "${file}" -C "${dest}" --strip-components=1 ;;
+          *Zstandard*) tar -I zstd -xf "${file}" -C "${dest}" --strip-components=1 ;;
+          *XZ*)        tar xJf "${file}" -C "${dest}" --strip-components=1 ;;
+          *)           error "Unknown archive format: ${ftype}" ;;
+        esac
+        ;;
+    esac
+  }
+
+  _extract "${DOWNLOAD_FILE}" "${STAGED_BIN_DIR}"
+  rm -f "${DOWNLOAD_FILE}"
+  trap - EXIT
+fi
+
 info "Staged binaries ready in ${STAGED_BIN_DIR} ✓"
 
 # --- Pre-flight checks -------------------------------------------------------
@@ -117,16 +239,22 @@ info "Staged binaries ready in ${STAGED_BIN_DIR} ✓"
 [[ -x "${STAGED_BIN_DIR}/cardano-node" ]] || error "No cardano-node binary in ${STAGED_BIN_DIR}"
 
 STAGED_VERSION=$("${STAGED_BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
-if [[ "${STAGED_VERSION}" != "${EXPECTED_NODE_VERSION}" ]]; then
-  error "Staged binary is ${STAGED_VERSION}, expected ${EXPECTED_NODE_VERSION}"
+if [[ "${STAGED_VERSION}" != "${TARGET_VERSION}" ]]; then
+  error "Staged binary is ${STAGED_VERSION}, expected ${TARGET_VERSION}"
 fi
 info "Staged binary version verified: ${STAGED_VERSION}"
 
 CURRENT_VERSION=$("${BIN_DIR}/cardano-node" --version 2>/dev/null | head -1 | awk '{print $2}') || CURRENT_VERSION="unknown"
 info "Current binary version: ${CURRENT_VERSION}"
 
+if [[ "${CURRENT_VERSION}" == "${TARGET_VERSION}" ]]; then
+  warn "Already running ${TARGET_VERSION}."
+  read -r -p "Continue anyway? [y/N]: " confirm
+  [[ "${confirm}" =~ ^[yY] ]] || { info "Aborted."; exit 0; }
+fi
+
 if ${DRY_RUN}; then
-  info "Dry run complete. Would upgrade ${CURRENT_VERSION} → ${EXPECTED_NODE_VERSION}"
+  info "Dry run complete. Would upgrade ${CURRENT_VERSION} → ${TARGET_VERSION}"
   exit 0
 fi
 
@@ -190,10 +318,10 @@ PROM_PORT="${PROM_PORT}" \
 EKG_PORT="${EKG_PORT}" \
 LEDGER_BACKEND="${LEDGER_BACKEND}" \
 NODE_ROLE="${NODE_ROLE}" \
-python3 << PYEOF
+python3 << 'PYEOF'
 import json, os
 
-config_path = "${FILES_DIR}/config.json"
+config_path = os.path.join(os.environ.get("CNODE_HOME", "/opt/cardano/cnode"), "files", "config.json")
 prom_bind = os.environ["PROM_BIND"]
 prom_port = int(os.environ["PROM_PORT"])
 ekg_port = int(os.environ["EKG_PORT"])
@@ -240,8 +368,9 @@ PYEOF
 
 # Validate final config
 python3 -c "
-import json
-c = json.load(open('${FILES_DIR}/config.json'))
+import json, os
+config_path = os.path.join(os.environ.get('CNODE_HOME', '/opt/cardano/cnode'), 'files', 'config.json')
+c = json.load(open(config_path))
 assert c['UseTraceDispatcher'] == True, 'UseTraceDispatcher not true'
 assert c['TraceChainDb'] == True, 'TraceChainDb missing'
 assert c['LedgerDB']['Backend'] == '${LEDGER_BACKEND}', 'Wrong backend'
@@ -274,8 +403,8 @@ info "Step 7: Installing new binaries..."
 cp "${STAGED_BIN_DIR}"/* "${BIN_DIR}/"
 
 INSTALLED_VERSION=$("${BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
-if [[ "${INSTALLED_VERSION}" != "${EXPECTED_NODE_VERSION}" ]]; then
-  error "Installed version ${INSTALLED_VERSION} != expected ${EXPECTED_NODE_VERSION}"
+if [[ "${INSTALLED_VERSION}" != "${TARGET_VERSION}" ]]; then
+  error "Installed version ${INSTALLED_VERSION} != expected ${TARGET_VERSION}"
 fi
 info "Binaries installed: cardano-node ${INSTALLED_VERSION} ✓"
 
@@ -347,10 +476,10 @@ sleep 5
 PROM_RESPONSE=$(curl -sf "http://localhost:${PROM_PORT}/metrics" 2>/dev/null | head -5) || true
 if [[ -n "${PROM_RESPONSE}" ]]; then
   METRICS_VERSION=$(curl -sf "http://localhost:${PROM_PORT}/metrics" | grep 'cardano_node_metrics_cardano_build_info' | grep -oP 'version="[^"]+' | cut -d'"' -f2) || true
-  if [[ "${METRICS_VERSION}" == "${EXPECTED_NODE_VERSION}" ]]; then
+  if [[ "${METRICS_VERSION}" == "${TARGET_VERSION}" ]]; then
     info "Prometheus metrics serving version ${METRICS_VERSION} ✓"
   else
-    warn "Prometheus responding but version='${METRICS_VERSION}' (expected ${EXPECTED_NODE_VERSION})"
+    warn "Prometheus responding but version='${METRICS_VERSION}' (expected ${TARGET_VERSION})"
   fi
 else
   warn "Prometheus not responding yet on port ${PROM_PORT} (may still be initializing)"
@@ -363,7 +492,7 @@ journalctl -u "${SERVICE_NAME}" --no-hostname -n 10 --no-pager 2>/dev/null || tr
 
 echo ""
 info "============================================"
-info "Upgrade to ${EXPECTED_NODE_VERSION} complete!"
+info "Upgrade to ${TARGET_VERSION} complete!"
 info "============================================"
 info ""
 info "Post-upgrade checklist:"
