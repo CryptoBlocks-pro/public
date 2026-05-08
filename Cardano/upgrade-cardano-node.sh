@@ -17,15 +17,18 @@ set -euo pipefail
 # Usage:
 #   ./upgrade-cardano-node.sh [--version X.Y.Z] [--relay|--bp] [--dry-run]
 #   ./upgrade-cardano-node.sh                          # auto-detect latest
-#   ./upgrade-cardano-node.sh --version 11.0.1 --bp
+#   ./upgrade-cardano-node.sh --version 11.0.1 --bp --keep-config
+#   ./upgrade-cardano-node.sh --version 12.0.0 --relay --fresh-db
 #   ./upgrade-cardano-node.sh --url https://... --version 10.7.1
 #
 # Flags:
-#   --version  Target version (default: latest GitHub release)
-#   --url      Custom binary download URL (overrides auto-detected URL)
-#   --relay    Include OpenBlockPerf traces (default)
-#   --bp       Block producer config (skip OpenBlockPerf traces)
-#   --dry-run  Show what would be done without making changes
+#   --version      Target version (default: latest GitHub release)
+#   --url          Custom binary download URL (overrides auto-detected URL)
+#   --relay        Include OpenBlockPerf traces (default)
+#   --bp           Block producer config (skip OpenBlockPerf traces)
+#   --keep-config  Skip config download/patch (use when config unchanged between versions)
+#   --fresh-db     Backup DB and deploy fresh Mithril snapshot (use for DB-breaking upgrades)
+#   --dry-run      Show what would be done without making changes
 #
 # Prerequisites:
 #   - Run as the node's service user (e.g. stakeman)
@@ -71,6 +74,8 @@ NODE_ROLE="relay"
 DRY_RUN=false
 TARGET_VERSION=""
 CUSTOM_URL=""
+KEEP_CONFIG=false
+FRESH_DB=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,10 +85,12 @@ while [[ $# -gt 0 ]]; do
     --url)
       [[ $# -ge 2 ]] || error "--url requires a value"
       CUSTOM_URL="$2"; shift 2 ;;
-    --relay)   NODE_ROLE="relay"; shift ;;
-    --bp)      NODE_ROLE="bp"; shift ;;
-    --dry-run) DRY_RUN=true; shift ;;
-    *)         error "Unknown argument: $1\nUsage: $0 [--version X.Y.Z] [--url URL] [--relay|--bp] [--dry-run]" ;;
+    --relay)       NODE_ROLE="relay"; shift ;;
+    --bp)          NODE_ROLE="bp"; shift ;;
+    --keep-config) KEEP_CONFIG=true; shift ;;
+    --fresh-db)    FRESH_DB=true; shift ;;
+    --dry-run)     DRY_RUN=true; shift ;;
+    *)             error "Unknown argument: $1\nUsage: $0 [--version X.Y.Z] [--url URL] [--relay|--bp] [--keep-config] [--fresh-db] [--dry-run]" ;;
   esac
 done
 
@@ -154,20 +161,25 @@ else
 fi
 
 # --- Choose LedgerDB backend -------------------------------------------------
-echo ""
-echo -e "${GREEN}LedgerDB backend options:${NC}"
-echo "  1) V2InMemory — ledger state in RAM (faster forging, higher memory ~16-24 GB)"
-echo "  2) V2LSM      — ledger state on disk (lower memory ~4-8 GB, slightly higher latency)"
-if [[ "${NODE_ROLE}" == "bp" ]]; then
-  echo -e "${YELLOW}[WARN]${NC}  V2InMemory is recommended for block producers to minimize forge latency."
+if ${KEEP_CONFIG}; then
+  LEDGER_BACKEND="(unchanged)"
+  info "LedgerDB backend: skipped (--keep-config)"
+else
+  echo ""
+  echo -e "${GREEN}LedgerDB backend options:${NC}"
+  echo "  1) V2InMemory — ledger state in RAM (faster forging, higher memory ~16-24 GB)"
+  echo "  2) V2LSM      — ledger state on disk (lower memory ~4-8 GB, slightly higher latency)"
+  if [[ "${NODE_ROLE}" == "bp" ]]; then
+    echo -e "${YELLOW}[WARN]${NC}  V2InMemory is recommended for block producers to minimize forge latency."
+  fi
+  read -r -p "Choose backend [1=V2InMemory (default), 2=V2LSM]: " backend_choice
+  case "${backend_choice}" in
+    2)  LEDGER_BACKEND="V2LSM" ;;
+    *)  LEDGER_BACKEND="V2InMemory" ;;
+  esac
+  info "LedgerDB backend: ${LEDGER_BACKEND}"
 fi
-read -r -p "Choose backend [1=V2InMemory (default), 2=V2LSM]: " backend_choice
-case "${backend_choice}" in
-  2)  LEDGER_BACKEND="V2LSM" ;;
-  *)  LEDGER_BACKEND="V2InMemory" ;;
-esac
 
-info "LedgerDB backend: ${LEDGER_BACKEND}"
 ${DRY_RUN} && info "DRY RUN — no changes will be made"
 
 # --- Step 0: Download staged binaries ----------------------------------------
@@ -230,6 +242,13 @@ if ! ${SKIP_DOWNLOAD}; then
   _extract "${DOWNLOAD_FILE}" "${STAGED_BIN_DIR}"
   rm -f "${DOWNLOAD_FILE}"
   trap - EXIT
+
+  # Handle tarballs that extract with a nested bin/ subdirectory (11.0.1+)
+  if [[ ! -x "${STAGED_BIN_DIR}/cardano-node" && -x "${STAGED_BIN_DIR}/bin/cardano-node" ]]; then
+    mv "${STAGED_BIN_DIR}"/bin/* "${STAGED_BIN_DIR}"/
+    rmdir "${STAGED_BIN_DIR}/bin" 2>/dev/null || true
+    rm -rf "${STAGED_BIN_DIR}/share" 2>/dev/null || true
+  fi
 fi
 
 info "Staged binaries ready in ${STAGED_BIN_DIR} ✓"
@@ -292,33 +311,36 @@ for bin in cardano-node cardano-cli; do
   fi
 done
 
-# --- Step 4: Download updated genesis + checkpoints -------------------------
-info "Step 4: Downloading updated genesis and checkpoints..."
-curl -sL "${CONWAY_GENESIS_URL}" -o "${FILES_DIR}/conway-genesis.json"
-curl -sL "${CHECKPOINTS_URL}" -o "${FILES_DIR}/checkpoints.json"
+# --- Step 4: Download updated genesis + checkpoints + config ----------------
+if ${KEEP_CONFIG}; then
+  info "Step 4: --keep-config specified — skipping config/genesis download and patching"
+else
+  info "Step 4: Downloading updated genesis, checkpoints, and config..."
+  curl -sL "${CONWAY_GENESIS_URL}" -o "${FILES_DIR}/conway-genesis.json"
+  curl -sL "${CHECKPOINTS_URL}" -o "${FILES_DIR}/checkpoints.json"
 
-# Verify downloads are valid JSON
-for f in conway-genesis.json checkpoints.json; do
-  python3 -c "import json; json.load(open('${FILES_DIR}/${f}'))" 2>/dev/null \
-    || error "Downloaded ${f} is not valid JSON"
-done
-info "Genesis and checkpoints updated ✓"
+  # Verify downloads are valid JSON
+  for f in conway-genesis.json checkpoints.json; do
+    python3 -c "import json; json.load(open('${FILES_DIR}/${f}'))" 2>/dev/null \
+      || error "Downloaded ${f} is not valid JSON"
+  done
+  info "Genesis and checkpoints updated ✓"
 
-# --- Step 5: Download and patch config.json ----------------------------------
-info "Step 5: Downloading official config.json and applying edits..."
-curl -sL "${CONFIG_URL}" -o "${FILES_DIR}/config.json"
+  # --- Download and patch config.json ----------------------------------------
+  info "  Downloading official config.json and applying edits..."
+  curl -sL "${CONFIG_URL}" -o "${FILES_DIR}/config.json"
 
-# Validate the download
-python3 -c "import json; json.load(open('${FILES_DIR}/config.json'))" 2>/dev/null \
-  || error "Downloaded config.json is not valid JSON"
+  # Validate the download
+  python3 -c "import json; json.load(open('${FILES_DIR}/config.json'))" 2>/dev/null \
+    || error "Downloaded config.json is not valid JSON"
 
-# Apply all edits via Python for reliability
-PROM_BIND="${PROM_BIND}" \
-PROM_PORT="${PROM_PORT}" \
-EKG_PORT="${EKG_PORT}" \
-LEDGER_BACKEND="${LEDGER_BACKEND}" \
-NODE_ROLE="${NODE_ROLE}" \
-python3 << 'PYEOF'
+  # Apply all edits via Python for reliability
+  PROM_BIND="${PROM_BIND}" \
+  PROM_PORT="${PROM_PORT}" \
+  EKG_PORT="${EKG_PORT}" \
+  LEDGER_BACKEND="${LEDGER_BACKEND}" \
+  NODE_ROLE="${NODE_ROLE}" \
+  python3 << 'PYEOF'
 import json, os
 
 config_path = os.path.join(os.environ.get("CNODE_HOME", "/opt/cardano/cnode"), "files", "config.json")
@@ -366,8 +388,8 @@ with open(config_path, 'w') as f:
 print("Config patched successfully")
 PYEOF
 
-# Validate final config
-python3 -c "
+  # Validate final config
+  python3 -c "
 import json, os
 config_path = os.path.join(os.environ.get('CNODE_HOME', '/opt/cardano/cnode'), 'files', 'config.json')
 c = json.load(open(config_path))
@@ -379,10 +401,11 @@ assert len(prom_line) == 1 and '${PROM_BIND}' in prom_line[0], 'Prometheus bind 
 print('Config validation passed ✓')
 " || error "Config validation failed"
 
-info "Config downloaded and patched ✓"
+  info "Config downloaded and patched ✓"
+fi
 
-# --- Step 6: Stop the node ---------------------------------------------------
-info "Step 6: Stopping ${SERVICE_NAME}..."
+# --- Step 5: Stop the node ---------------------------------------------------
+info "Step 5: Stopping ${SERVICE_NAME}..."
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   sudo systemctl stop "${SERVICE_NAME}"
   # Wait for clean shutdown
@@ -398,8 +421,8 @@ else
   warn "Service was not running"
 fi
 
-# --- Step 7: Copy new binaries -----------------------------------------------
-info "Step 7: Installing new binaries..."
+# --- Step 6: Copy new binaries -----------------------------------------------
+info "Step 6: Installing new binaries..."
 cp "${STAGED_BIN_DIR}"/* "${BIN_DIR}/"
 
 INSTALLED_VERSION=$("${BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
@@ -408,36 +431,40 @@ if [[ "${INSTALLED_VERSION}" != "${TARGET_VERSION}" ]]; then
 fi
 info "Binaries installed: cardano-node ${INSTALLED_VERSION} ✓"
 
-# --- Step 8: Rename old DB and deploy Mithril snapshot -----------------------
-info "Step 8: Renaming old database and deploying Mithril snapshot..."
-if [[ -d "${DB_DIR}" ]]; then
-  DB_BACKUP="${DB_DIR}-${CURRENT_VERSION}-bak"
-  if [[ -d "${DB_BACKUP}" ]]; then
-    warn "DB backup already exists: ${DB_BACKUP} — removing current DB"
-    rm -rf "${DB_DIR}"
+# --- Step 7: Handle database (keep or fresh Mithril) ------------------------
+if ${FRESH_DB}; then
+  info "Step 7: --fresh-db specified — backing up DB and deploying Mithril snapshot..."
+  if [[ -d "${DB_DIR}" ]]; then
+    DB_BACKUP="${DB_DIR}-${CURRENT_VERSION}-bak"
+    if [[ -d "${DB_BACKUP}" ]]; then
+      warn "DB backup already exists: ${DB_BACKUP} — removing current DB"
+      rm -rf "${DB_DIR}"
+    else
+      mv "${DB_DIR}" "${DB_BACKUP}"
+      info "DB renamed to ${DB_BACKUP}"
+    fi
   else
-    mv "${DB_DIR}" "${DB_BACKUP}"
-    info "DB renamed to ${DB_BACKUP}"
+    warn "No database directory found at ${DB_DIR}"
   fi
+
+  MITHRIL_SCRIPT="${HOME}/DeployMithrilUncompressOnTheFly.sh"
+  MITHRIL_SCRIPT_URL="https://raw.githubusercontent.com/CryptoBlocks-pro/public/main/Cardano/DeployMithrilUncompressOnTheFly.sh"
+  if [[ ! -x "${MITHRIL_SCRIPT}" ]]; then
+    info "Mithril deploy script not found — downloading..."
+    curl -sL "${MITHRIL_SCRIPT_URL}" -o "${MITHRIL_SCRIPT}"
+    chmod +x "${MITHRIL_SCRIPT}"
+    [[ -x "${MITHRIL_SCRIPT}" ]] || error "Failed to download Mithril deploy script"
+    info "Downloaded ${MITHRIL_SCRIPT} ✓"
+  fi
+  info "Deploying fresh Mithril snapshot to ${DB_DIR}..."
+  "${MITHRIL_SCRIPT}" --path "${DB_DIR}" --yes
+  info "Mithril snapshot deployed ✓"
 else
-  warn "No database directory found at ${DB_DIR}"
+  info "Step 7: Keeping existing database (use --fresh-db if DB format changed)"
 fi
 
-MITHRIL_SCRIPT="${HOME}/DeployMithrilUncompressOnTheFly.sh"
-MITHRIL_SCRIPT_URL="https://raw.githubusercontent.com/CryptoBlocks-pro/public/main/Cardano/DeployMithrilUncompressOnTheFly.sh"
-if [[ ! -x "${MITHRIL_SCRIPT}" ]]; then
-  info "Mithril deploy script not found — downloading..."
-  curl -sL "${MITHRIL_SCRIPT_URL}" -o "${MITHRIL_SCRIPT}"
-  chmod +x "${MITHRIL_SCRIPT}"
-  [[ -x "${MITHRIL_SCRIPT}" ]] || error "Failed to download Mithril deploy script"
-  info "Downloaded ${MITHRIL_SCRIPT} ✓"
-fi
-info "Deploying fresh Mithril snapshot to ${DB_DIR}..."
-"${MITHRIL_SCRIPT}" --path "${DB_DIR}" --yes
-info "Mithril snapshot deployed ✓"
-
-# --- Step 9: Start the node --------------------------------------------------
-info "Step 9: Starting ${SERVICE_NAME}..."
+# --- Step 8: Start the node --------------------------------------------------
+info "Step 8: Starting ${SERVICE_NAME}..."
 sudo systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
 sudo systemctl start "${SERVICE_NAME}"
 
@@ -468,8 +495,8 @@ if ! ${STARTED}; then
   fi
 fi
 
-# --- Step 10: Validate -------------------------------------------------------
-info "Step 10: Validating..."
+# --- Step 9: Validate -------------------------------------------------------
+info "Step 9: Validating..."
 
 # Check Prometheus
 sleep 5
@@ -496,9 +523,15 @@ info "Upgrade to ${TARGET_VERSION} complete!"
 info "============================================"
 info ""
 info "Post-upgrade checklist:"
-info "  1. Monitor replay: journalctl -u ${SERVICE_NAME} -f --no-hostname"
+info "  1. Monitor sync: journalctl -u ${SERVICE_NAME} -f --no-hostname"
 info "  2. Check Prometheus: curl -s http://localhost:${PROM_PORT}/metrics | head -20"
 info "  3. Check gLiveView once synced: /opt/cardano/cnode/scripts/gLiveView.sh"
+if ! ${FRESH_DB}; then
+  info ""
+  info "  ⚠️  If the node appears to be replaying from genesis (slot numbers starting"
+  info "     from 0), the DB format may have changed. Re-run with --fresh-db:"
+  info "     $0 --version ${TARGET_VERSION} --${NODE_ROLE} --fresh-db"
+fi
 if [[ "${NODE_ROLE}" == "relay" ]]; then
   info "  4. Verify OpenBlockPerf: journalctl -u ${SERVICE_NAME} --no-hostname | grep CompletedBlockFetch"
 fi
