@@ -502,7 +502,7 @@ info "Step 9: Validating..."
 sleep 5
 PROM_RESPONSE=$(curl -sf "http://localhost:${PROM_PORT}/metrics" 2>/dev/null | head -5) || true
 if [[ -n "${PROM_RESPONSE}" ]]; then
-  METRICS_VERSION=$(curl -sf "http://localhost:${PROM_PORT}/metrics" | grep 'cardano_node_metrics_cardano_build_info' | grep -oP 'version="[^"]+' | cut -d'"' -f2) || true
+  METRICS_VERSION=$(curl -sf "http://localhost:${PROM_PORT}/metrics" | grep 'cardano_node_metrics_cardano_build_info' | grep -oP '[ ,{]version="[^"]+' | cut -d'"' -f2 | head -1) || true
   if [[ "${METRICS_VERSION}" == "${TARGET_VERSION}" ]]; then
     info "Prometheus metrics serving version ${METRICS_VERSION} ✓"
   else
