@@ -58,6 +58,11 @@ PROM_BIND="0.0.0.0"
 PROM_PORT="12798"
 EKG_PORT="12788"
 
+SNAPSHOT_SAFETY_GB="${SNAPSHOT_SAFETY_GB:-20}"
+MITHRIL_CLIENT_BIN="${MITHRIL_CLIENT_BIN:-${BIN_DIR}/mithril-client}"
+MITHRIL_RELEASE_TAG="${MITHRIL_RELEASE_TAG:-latest}"
+MITHRIL_SIGNING_FPR="${MITHRIL_SIGNING_FPR:-73FC4C3DFD55DBDC428AD2B5BE043B79FDA4C2EE}"
+
 # --- Color helpers -----------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +73,199 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+bytes_to_gib() {
+  awk -v b="$1" 'BEGIN { printf "%.2f", b/1024/1024/1024 }'
+}
+
+check_snapshot_disk_space() {
+  local target_path avail_bytes db_size_bytes required_bytes safety_bytes
+  target_path="$(dirname "${DB_DIR}")"
+  safety_bytes=$((SNAPSHOT_SAFETY_GB * 1024 * 1024 * 1024))
+  avail_bytes=$(df -B1 --output=avail "${target_path}" 2>/dev/null | tail -1 | tr -d ' ')
+  [[ "${avail_bytes}" =~ ^[0-9]+$ ]] || error "Could not determine free space for ${target_path}"
+
+  if [[ -d "${DB_DIR}" ]]; then
+    db_size_bytes=$(du -s -B1 "${DB_DIR}" 2>/dev/null | awk '{print $1}')
+    [[ "${db_size_bytes}" =~ ^[0-9]+$ ]] || error "Could not determine current DB size at ${DB_DIR}"
+  else
+    db_size_bytes=0
+  fi
+
+  required_bytes=$((db_size_bytes + safety_bytes))
+
+  info "Disk preflight (target: ${target_path})"
+  info "  Available: $(bytes_to_gib "${avail_bytes}") GiB"
+  info "  Estimated required for snapshot + buffer: $(bytes_to_gib "${required_bytes}") GiB"
+
+  if (( avail_bytes < required_bytes )); then
+    error "Insufficient free space for snapshot deploy. Need at least $(bytes_to_gib "${required_bytes}") GiB free (current DB size + ${SNAPSHOT_SAFETY_GB} GiB buffer), but only $(bytes_to_gib "${avail_bytes}") GiB is available."
+  fi
+}
+
+ensure_protocol_magic_id() {
+  local protocol_file genesis_magic
+  protocol_file="${DB_DIR}/protocolMagicId"
+
+  if [[ -s "${protocol_file}" ]]; then
+    if [[ "$(tr -d '[:space:]' < "${protocol_file}")" =~ ^[0-9]+$ ]]; then
+      info "protocolMagicId already present at ${protocol_file}"
+      return 0
+    fi
+    warn "protocolMagicId exists but is invalid, regenerating..."
+  fi
+
+  [[ -f "${FILES_DIR}/shelley-genesis.json" ]] || error "Missing genesis file: ${FILES_DIR}/shelley-genesis.json"
+  genesis_magic=$(jq -r '.networkMagic' "${FILES_DIR}/shelley-genesis.json" 2>/dev/null || true)
+  [[ "${genesis_magic}" =~ ^[0-9]+$ ]] || error "Could not parse networkMagic from ${FILES_DIR}/shelley-genesis.json"
+
+  echo -n "${genesis_magic}" > "${protocol_file}"
+  chmod 0644 "${protocol_file}"
+  chown "$(id -u):$(id -g)" "${protocol_file}" 2>/dev/null || true
+
+  [[ -s "${protocol_file}" ]] || error "Failed to create ${protocol_file}"
+  [[ "$(tr -d '[:space:]' < "${protocol_file}")" == "${genesis_magic}" ]] || error "protocolMagicId content mismatch after write"
+  info "Created ${protocol_file} with network magic ${genesis_magic} ✓"
+}
+
+resolve_mithril_release_tag() {
+  if [[ "${MITHRIL_RELEASE_TAG}" != "latest" ]]; then
+    echo "${MITHRIL_RELEASE_TAG}"
+    return 0
+  fi
+
+  local latest_tag
+  latest_tag=$(curl -fsSL "https://api.github.com/repos/input-output-hk/mithril/releases/latest" | jq -r '.tag_name')
+  [[ -n "${latest_tag}" && "${latest_tag}" != "null" ]] || return 1
+  echo "${latest_tag}"
+}
+
+install_mithril_client() {
+  if [[ -x "${MITHRIL_CLIENT_BIN}" ]]; then
+    info "mithril-client already present at ${MITHRIL_CLIENT_BIN}"
+    return 0
+  fi
+
+  local mithril_arch release_tag tarball_name tarball_url tmpdir
+  case "${ARCH}" in
+    aarch64) mithril_arch="linux-arm64" ;;
+    x86_64)  mithril_arch="linux-x64" ;;
+    *)       warn "Unsupported architecture for prebuilt mithril-client: ${ARCH}"; return 1 ;;
+  esac
+
+  release_tag=$(resolve_mithril_release_tag) || {
+    warn "Could not resolve latest Mithril release tag"
+    return 1
+  }
+
+  tarball_name="mithril-${release_tag}-${mithril_arch}.tar.gz"
+  tarball_url="https://github.com/input-output-hk/mithril/releases/download/${release_tag}/${tarball_name}"
+
+  info "Installing official mithril-client from ${tarball_url}"
+  tmpdir=$(mktemp -d)
+  mkdir -p "${BIN_DIR}"
+  curl -fL "${tarball_url}" -o "${tmpdir}/mithril.tar.gz"
+  verify_mithril_download_signature "${release_tag}" "${tarball_name}" "${tmpdir}" || {
+    rm -rf "${tmpdir}"
+    warn "Skipping official mithril-client install due to signature/checksum verification failure"
+    return 1
+  }
+  tar -xzf "${tmpdir}/mithril.tar.gz" -C "${tmpdir}"
+  [[ -f "${tmpdir}/mithril-client" ]] || {
+    rm -rf "${tmpdir}"
+    warn "mithril-client binary not found in ${tarball_name}"
+    return 1
+  }
+
+  install -m 0755 "${tmpdir}/mithril-client" "${MITHRIL_CLIENT_BIN}"
+  rm -rf "${tmpdir}"
+
+  "${MITHRIL_CLIENT_BIN}" --version >/dev/null 2>&1 || {
+    warn "Installed mithril-client failed version check"
+    return 1
+  }
+  info "Installed mithril-client at ${MITHRIL_CLIENT_BIN} ✓"
+}
+
+verify_mithril_download_signature() {
+  local release_tag tarball_name tmpdir release_base checksum_url key_url checksum_file key_file
+  local gnupghome key_fpr expected_sha actual_sha
+
+  release_tag="$1"
+  tarball_name="$2"
+  tmpdir="$3"
+  release_base="https://github.com/input-output-hk/mithril/releases/download/${release_tag}"
+  checksum_url="${release_base}/CHECKSUM.asc"
+  key_url="${release_base}/public-key.gpg"
+  checksum_file="${tmpdir}/CHECKSUM.asc"
+  key_file="${tmpdir}/public-key.gpg"
+
+  info "Downloading Mithril checksum and signing key..."
+  curl -fL "${checksum_url}" -o "${checksum_file}" || {
+    warn "Failed to download CHECKSUM.asc"
+    return 1
+  }
+  curl -fL "${key_url}" -o "${key_file}" || {
+    warn "Failed to download public-key.gpg"
+    return 1
+  }
+
+  gnupghome="${tmpdir}/gnupg"
+  mkdir -p "${gnupghome}"
+  chmod 700 "${gnupghome}"
+
+  GNUPGHOME="${gnupghome}" gpg --batch --import "${key_file}" >/dev/null 2>&1 || {
+    warn "Failed to import Mithril public key"
+    return 1
+  }
+
+  key_fpr=$(GNUPGHOME="${gnupghome}" gpg --batch --with-colons --show-keys "${key_file}" 2>/dev/null | awk -F: '/^fpr:/ { print $10; exit }')
+  if [[ "${key_fpr}" != "${MITHRIL_SIGNING_FPR}" ]]; then
+    warn "Mithril signing key fingerprint mismatch. Expected ${MITHRIL_SIGNING_FPR}, got ${key_fpr:-unknown}"
+    return 1
+  fi
+
+  GNUPGHOME="${gnupghome}" gpg --batch --verify "${checksum_file}" >/dev/null 2>&1 || {
+    warn "CHECKSUM.asc signature verification failed"
+    return 1
+  }
+
+  expected_sha=$(GNUPGHOME="${gnupghome}" gpg --batch --decrypt "${checksum_file}" 2>/dev/null | awk -v fn="./${tarball_name}" '$2 == fn { print $1; exit }')
+  [[ "${expected_sha}" =~ ^[0-9a-f]{64}$ ]] || {
+    warn "Could not extract expected checksum for ${tarball_name} from CHECKSUM.asc"
+    return 1
+  }
+
+  actual_sha=$(sha256sum "${tmpdir}/mithril.tar.gz" | awk '{print $1}')
+  if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+    warn "Tarball checksum mismatch for ${tarball_name}"
+    warn "Expected: ${expected_sha}"
+    warn "Actual:   ${actual_sha}"
+    return 1
+  fi
+
+  info "Mithril tarball signature and checksum validated ✓"
+}
+
+deploy_snapshot_with_official_client() {
+  [[ -x "${MITHRIL_CLIENT_BIN}" ]] || return 1
+
+  local aggregator_endpoint genesis_vkey ancillary_vkey
+  aggregator_endpoint="https://aggregator.release-mainnet.api.mithril.network/aggregator"
+
+  genesis_vkey=$(curl -fsSL "https://raw.githubusercontent.com/input-output-hk/mithril/main/mithril-infra/configuration/release-mainnet/genesis.vkey") || return 1
+  ancillary_vkey=$(curl -fsSL "https://raw.githubusercontent.com/input-output-hk/mithril/main/mithril-infra/configuration/release-mainnet/ancillary.vkey") || return 1
+
+  info "Deploying fresh Mithril snapshot to ${DB_DIR} using official mithril-client..."
+  "${MITHRIL_CLIENT_BIN}" -v \
+    --aggregator-endpoint "${aggregator_endpoint}" \
+    cardano-db download \
+    --download-dir "$(dirname "${DB_DIR}")" \
+    --genesis-verification-key "${genesis_vkey}" \
+    --ancillary-verification-key "${ancillary_vkey}" \
+    --include-ancillary \
+    latest
+}
 
 # --- Parse arguments ---------------------------------------------------------
 NODE_ROLE="relay"
@@ -480,6 +678,11 @@ info "Binaries installed: cardano-node ${INSTALLED_VERSION} ✓"
 # --- Step 7: Handle database (keep or fresh Mithril) ------------------------
 if ${FRESH_DB}; then
   info "Step 7: --fresh-db specified — backing up DB and deploying Mithril snapshot..."
+
+  # Disk space preflight
+  info "  Checking free disk space before snapshot deploy..."
+  check_snapshot_disk_space
+
   if [[ -d "${DB_DIR}" ]]; then
     DB_BACKUP="${DB_DIR}-${CURRENT_VERSION}-bak"
     if [[ -d "${DB_BACKUP}" ]]; then
@@ -495,16 +698,31 @@ if ${FRESH_DB}; then
 
   MITHRIL_SCRIPT="${HOME}/DeployMithrilUncompressOnTheFly.sh"
   MITHRIL_SCRIPT_URL="https://raw.githubusercontent.com/CryptoBlocks-pro/public/main/Cardano/DeployMithrilUncompressOnTheFly.sh"
-  if [[ ! -x "${MITHRIL_SCRIPT}" ]]; then
-    info "Mithril deploy script not found — downloading..."
-    curl -sL "${MITHRIL_SCRIPT_URL}" -o "${MITHRIL_SCRIPT}"
-    chmod +x "${MITHRIL_SCRIPT}"
-    [[ -x "${MITHRIL_SCRIPT}" ]] || error "Failed to download Mithril deploy script"
-    info "Downloaded ${MITHRIL_SCRIPT} ✓"
+
+  official_deploy_ok=false
+  if install_mithril_client && deploy_snapshot_with_official_client; then
+    official_deploy_ok=true
+    info "Mithril snapshot deployed via official mithril-client ✓"
+  else
+    warn "Official mithril-client deploy failed or unavailable, falling back to custom deploy script"
   fi
-  info "Deploying fresh Mithril snapshot to ${DB_DIR}..."
-  "${MITHRIL_SCRIPT}" --path "${DB_DIR}" --yes
-  info "Mithril snapshot deployed ✓"
+
+  if [[ "${official_deploy_ok}" != "true" ]]; then
+    if [[ ! -x "${MITHRIL_SCRIPT}" ]]; then
+      info "Mithril deploy script not found — downloading..."
+      curl -sL "${MITHRIL_SCRIPT_URL}" -o "${MITHRIL_SCRIPT}"
+      chmod +x "${MITHRIL_SCRIPT}"
+      [[ -x "${MITHRIL_SCRIPT}" ]] || error "Failed to download Mithril deploy script"
+      info "Downloaded ${MITHRIL_SCRIPT} ✓"
+    fi
+
+    info "Deploying fresh Mithril snapshot to ${DB_DIR} with fallback script..."
+    "${MITHRIL_SCRIPT}" --path "${DB_DIR}" --yes
+    info "Mithril snapshot deployed via fallback script ✓"
+  fi
+
+  # Ensure db metadata file exists for node startup
+  ensure_protocol_magic_id
 else
   info "Step 7: Keeping existing database (use --fresh-db if DB format changed)"
 fi
