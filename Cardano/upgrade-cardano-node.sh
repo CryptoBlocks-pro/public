@@ -180,6 +180,52 @@ else
   info "LedgerDB backend: ${LEDGER_BACKEND}"
 fi
 
+# --- Smart DB decision (unless --fresh-db already set) -----------------------
+if ! ${FRESH_DB} && ! ${KEEP_CONFIG}; then
+  # Detect current backend from existing config
+  CURRENT_BACKEND=""
+  if [[ -f "${FILES_DIR}/config.json" ]]; then
+    CURRENT_BACKEND=$(python3 -c "
+import json
+try:
+    c = json.load(open('${FILES_DIR}/config.json'))
+    print(c.get('LedgerDB', {}).get('Backend', ''))
+except: pass
+" 2>/dev/null) || CURRENT_BACKEND=""
+  fi
+
+  RECOMMEND_FRESH=false
+  FRESH_REASON=""
+
+  # Check for backend change
+  if [[ -n "${CURRENT_BACKEND}" && "${CURRENT_BACKEND}" != "${LEDGER_BACKEND}" ]]; then
+    RECOMMEND_FRESH=true
+    FRESH_REASON="Backend changing from ${CURRENT_BACKEND} → ${LEDGER_BACKEND} (ledger format incompatible)"
+  fi
+
+  echo ""
+  if ${RECOMMEND_FRESH}; then
+    echo -e "${YELLOW}[WARN]${NC}  ${FRESH_REASON}"
+    echo -e "${YELLOW}[WARN]${NC}  A fresh Mithril snapshot is recommended to avoid hours of ledger replay."
+    echo ""
+    echo "  1) Deploy fresh Mithril snapshot (recommended)"
+    echo "  2) Keep existing database"
+    read -r -p "Choose [1=fresh (default), 2=keep]: " db_choice
+    case "${db_choice}" in
+      2)  info "Keeping existing database" ;;
+      *)  FRESH_DB=true; info "Will deploy fresh Mithril snapshot" ;;
+    esac
+  else
+    echo "  1) Keep existing database (recommended — same backend, minor upgrade)"
+    echo "  2) Deploy fresh Mithril snapshot"
+    read -r -p "Choose [1=keep (default), 2=fresh]: " db_choice
+    case "${db_choice}" in
+      2)  FRESH_DB=true; info "Will deploy fresh Mithril snapshot" ;;
+      *)  info "Keeping existing database" ;;
+    esac
+  fi
+fi
+
 ${DRY_RUN} && info "DRY RUN — no changes will be made"
 
 # --- Step 0: Download staged binaries ----------------------------------------
