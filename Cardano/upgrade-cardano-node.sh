@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ###############################################################################
-# Cardano Node Upgrade Script (multi-version, multi-arch)
+# Cardano Node Upgrade Script (multi-network, multi-version, multi-arch)
 #
 # Upgrades a Guild Operators (Koios/CNTools) managed cardano-node.
 # Handles:
@@ -10,24 +10,29 @@ set -euo pipefail
 #   - Multi-architecture support (x86_64 / aarch64)
 #   - System dependency installation
 #   - Config/binary/DB backup
-#   - Official config.json download + edits
-#   - Genesis + checkpoints file updates
+#   - Existing instance configuration preserved by default
+#   - Optional official config/genesis refresh for schema-breaking upgrades
 #   - Binary swap and service restart
 #
 # Usage:
-#   ./upgrade-cardano-node.sh [--version X.Y.Z] [--relay|--bp] [--dry-run]
+#   ./upgrade-cardano-node.sh [--network mainnet|preprod|preview] [--version X.Y.Z] [--relay|--bp] [--dry-run]
 #   ./upgrade-cardano-node.sh                          # auto-detect latest
-#   ./upgrade-cardano-node.sh --version 11.0.1 --bp --keep-config
+#   ./upgrade-cardano-node.sh --network preview --bp
+#   ./upgrade-cardano-node.sh --network preprod --version 11.1.2 --bp
 #   ./upgrade-cardano-node.sh --version 12.0.0 --relay --fresh-db
 #   ./upgrade-cardano-node.sh --url https://... --version 10.7.1
 #
 # Flags:
+#   --network      Network profile: mainnet, preprod, or preview (default: mainnet)
 #   --version      Target version (default: latest GitHub release)
 #   --url          Custom binary download URL (overrides auto-detected URL)
 #   --relay        Include OpenBlockPerf traces (default)
 #   --bp           Block producer config (skip OpenBlockPerf traces)
-#   --keep-config  Skip config download/patch (use when config unchanged between versions)
+#   --keep-config  Preserve config/genesis files (default)
+#   --refresh-config Download current official config/genesis files and apply local metrics
 #   --fresh-db     Backup DB and deploy fresh Mithril snapshot (use for DB-breaking upgrades)
+#   --ledger-backend V2InMemory|V2LSM (default: current backend, or V2InMemory)
+#   --yes          Accept recommended defaults without prompting
 #   --dry-run      Show what would be done without making changes
 #
 # Prerequisites:
@@ -35,28 +40,28 @@ set -euo pipefail
 #   - sudo access for systemctl and apt-get
 #   - curl and python3 available
 #
-# Tested: 10.6.2 → 10.7.1, 10.7.1 → 11.0.1 on Ubuntu 24.04 (Azure)
+# Tested: 10.6.2 -> 10.7.1, 10.7.1 -> 11.0.1 on Ubuntu 24.04 (Azure)
 ###############################################################################
 
 # --- Configuration -----------------------------------------------------------
-CNODE_HOME="${CNODE_HOME:-/opt/cardano/cnode}"
-FILES_DIR="${CNODE_HOME}/files"
-DB_DIR="${CNODE_HOME}/db"
 BIN_DIR="${HOME}/.local/bin"
 STAGED_BIN_DIR="${HOME}/tmp/bin"
 BACKUP_BIN_DIR="${HOME}/tmp/backup-bin"
-SERVICE_NAME="cnode.service"
 
 GITHUB_REPO="IntersectMBO/cardano-node"
 GITHUB_API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 
-CONFIG_URL="https://book.play.dev.cardano.org/environments/mainnet/config.json"
-CONWAY_GENESIS_URL="https://book.play.dev.cardano.org/environments/mainnet/conway-genesis.json"
-CHECKPOINTS_URL="https://book.play.dev.cardano.org/environments/mainnet/checkpoints.json"
-
+NETWORK="mainnet"
+CNODE_HOME=""
+FILES_DIR=""
+DB_DIR=""
+SERVICE_NAME=""
+ENV_FILE=""
+CONFIG_BASE_URL=""
 PROM_BIND="0.0.0.0"
-PROM_PORT="12798"
-EKG_PORT="12788"
+PROM_PORT=""
+EXPECTED_NETWORK_MAGIC=""
+MITHRIL_NETWORK=""
 
 SNAPSHOT_SAFETY_GB="${SNAPSHOT_SAFETY_GB:-20}"
 MITHRIL_CLIENT_BIN="${MITHRIL_CLIENT_BIN:-${BIN_DIR}/mithril-client}"
@@ -251,10 +256,10 @@ deploy_snapshot_with_official_client() {
   [[ -x "${MITHRIL_CLIENT_BIN}" ]] || return 1
 
   local aggregator_endpoint genesis_vkey ancillary_vkey
-  aggregator_endpoint="https://aggregator.release-mainnet.api.mithril.network/aggregator"
+  aggregator_endpoint="https://aggregator.${MITHRIL_NETWORK}.api.mithril.network/aggregator"
 
-  genesis_vkey=$(curl -fsSL "https://raw.githubusercontent.com/input-output-hk/mithril/main/mithril-infra/configuration/release-mainnet/genesis.vkey") || return 1
-  ancillary_vkey=$(curl -fsSL "https://raw.githubusercontent.com/input-output-hk/mithril/main/mithril-infra/configuration/release-mainnet/ancillary.vkey") || return 1
+  genesis_vkey=$(curl -fsSL "https://raw.githubusercontent.com/input-output-hk/mithril/main/mithril-infra/configuration/${MITHRIL_NETWORK}/genesis.vkey") || return 1
+  ancillary_vkey=$(curl -fsSL "https://raw.githubusercontent.com/input-output-hk/mithril/main/mithril-infra/configuration/${MITHRIL_NETWORK}/ancillary.vkey") || return 1
 
   info "Deploying fresh Mithril snapshot to ${DB_DIR} using official mithril-client..."
   "${MITHRIL_CLIENT_BIN}" -v \
@@ -267,16 +272,135 @@ deploy_snapshot_with_official_client() {
     latest
 }
 
+verify_cardano_archive_checksum() {
+  local archive_path archive_name checksums_url expected_sha actual_sha
+  archive_path="$1"
+  archive_name="cardano-node-${TARGET_VERSION}-linux-$([[ "${ARCH}" == "x86_64" ]] && echo amd64 || echo arm64).tar.gz"
+
+  if [[ -n "${CUSTOM_URL}" ]]; then
+    warn "Custom binary URL supplied; official release checksum verification skipped"
+    return 0
+  fi
+
+  checksums_url="https://github.com/${GITHUB_REPO}/releases/download/${TARGET_VERSION}/cardano-node-${TARGET_VERSION}-sha256sums.txt"
+  expected_sha=$(curl -fsSL "${checksums_url}" | awk -v name="${archive_name}" '$2 == name || $2 == "*" name { print $1; exit }')
+  [[ "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]] || error "Could not find ${archive_name} in official checksum file"
+  actual_sha=$(sha256sum "${archive_path}" | awk '{print $1}')
+  [[ "${actual_sha}" == "${expected_sha}" ]] || error "Cardano node archive checksum mismatch"
+  info "Official Cardano node archive checksum verified ✓"
+}
+
+set_env_value() {
+  local env_file key value
+  env_file="$1"
+  key="$2"
+  value="$3"
+  python3 - "${env_file}" "${key}" "${value}" <<'PYEOF'
+import pathlib, re, sys
+
+path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+text = path.read_text()
+replacement = f'{key}="{value}"'
+pattern = re.compile(rf'^#?{re.escape(key)}=.*$', re.MULTILINE)
+if pattern.search(text):
+    text = pattern.sub(replacement, text, count=1)
+else:
+    text = replacement + '\n' + text
+path.write_text(text)
+PYEOF
+}
+
+ROLLBACK_ARMED=false
+NODE_WAS_ACTIVE=false
+BINARY_BACKUP_DIR=""
+DB_BACKUP=""
+ENV_CHANGED=false
+declare -a CONFIG_INSTALLED_FILES=()
+
+rollback_on_exit() {
+  local status=$?
+  local rollback_failed=false restored_topology_hash
+  [[ "${status}" -ne 0 && "${ROLLBACK_ARMED}" == "true" ]] || return "${status}"
+  trap - EXIT
+  set +e
+
+  warn "Upgrade failed after activation began; restoring the previous installation..."
+  sudo systemctl stop "${SERVICE_NAME}" 2>/dev/null || rollback_failed=true
+
+  for config_name in "${CONFIG_INSTALLED_FILES[@]}"; do
+    if [[ -f "${FILES_DIR}-${BACKUP_SUFFIX}/${config_name}" ]]; then
+      sudo rm -f "${FILES_DIR}/${config_name}" \
+        && sudo cp -a "${FILES_DIR}-${BACKUP_SUFFIX}/${config_name}" "${FILES_DIR}/${config_name}" \
+        || rollback_failed=true
+    else
+      sudo rm -f "${FILES_DIR}/${config_name}" || rollback_failed=true
+    fi
+  done
+  if ${ENV_CHANGED}; then
+    if [[ -f "${ENV_FILE}-${BACKUP_SUFFIX}" ]]; then
+      sudo cp -a "${ENV_FILE}-${BACKUP_SUFFIX}" "${ENV_FILE}" || rollback_failed=true
+    else
+      rollback_failed=true
+    fi
+  fi
+
+  if [[ -d "${BINARY_BACKUP_DIR}" ]]; then
+    while IFS= read -r -d '' staged_file; do
+      binary_name=$(basename "${staged_file}")
+      if [[ -f "${BINARY_BACKUP_DIR}/${binary_name}" ]]; then
+        install -m 0755 "${BINARY_BACKUP_DIR}/${binary_name}" "${ACTIVE_BIN_DIR}/.${binary_name}.rollback" \
+          && mv -f "${ACTIVE_BIN_DIR}/.${binary_name}.rollback" "${ACTIVE_BIN_DIR}/${binary_name}" \
+          || rollback_failed=true
+      else
+        rm -f "${ACTIVE_BIN_DIR}/${binary_name}" || rollback_failed=true
+      fi
+    done < <(find "${STAGED_BIN_DIR}" -maxdepth 1 -type f -print0)
+  else
+    rollback_failed=true
+  fi
+
+  if [[ -n "${DB_BACKUP}" && -d "${DB_BACKUP}" ]]; then
+    rm -rf "${DB_DIR}" && mv "${DB_BACKUP}" "${DB_DIR}" || rollback_failed=true
+  fi
+
+  if [[ "${NODE_WAS_ACTIVE}" == "true" ]]; then
+    sudo systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
+    sudo systemctl start "${SERVICE_NAME}" || rollback_failed=true
+    systemctl is-active --quiet "${SERVICE_NAME}" || rollback_failed=true
+  fi
+  if [[ -f "${TOPOLOGY_FILE}" ]]; then
+    restored_topology_hash=$(sha256sum "${TOPOLOGY_FILE}" | awk '{print $1}')
+    [[ "${restored_topology_hash}" == "${TOPOLOGY_HASH_BEFORE}" ]] \
+      || rollback_failed=true
+  else
+    rollback_failed=true
+  fi
+  if ${rollback_failed}; then
+    warn "ROLLBACK INCOMPLETE; manual recovery is required from backups ending ${BACKUP_SUFFIX}"
+  else
+    warn "Rollback completed and previous service state restored"
+  fi
+  exit "${status}"
+}
+
 # --- Parse arguments ---------------------------------------------------------
 NODE_ROLE="relay"
 DRY_RUN=false
 TARGET_VERSION=""
 CUSTOM_URL=""
-KEEP_CONFIG=false
+KEEP_CONFIG=true
 FRESH_DB=false
+ASSUME_YES=false
+LEDGER_BACKEND=""
+LEDGER_BACKEND_EXPLICIT=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --network)
+      [[ $# -ge 2 ]] || error "--network requires mainnet, preprod, or preview"
+      NETWORK="$2"; shift 2 ;;
     --version)
       [[ $# -ge 2 ]] || error "--version requires a value (e.g. --version 11.0.1)"
       TARGET_VERSION="$2"; shift 2 ;;
@@ -286,11 +410,90 @@ while [[ $# -gt 0 ]]; do
     --relay)       NODE_ROLE="relay"; shift ;;
     --bp)          NODE_ROLE="bp"; shift ;;
     --keep-config) KEEP_CONFIG=true; shift ;;
+    --refresh-config) KEEP_CONFIG=false; shift ;;
     --fresh-db)    FRESH_DB=true; shift ;;
+    --ledger-backend)
+      [[ $# -ge 2 ]] || error "--ledger-backend requires V2InMemory or V2LSM"
+      LEDGER_BACKEND="$2"; LEDGER_BACKEND_EXPLICIT=true; shift 2 ;;
+    --yes)         ASSUME_YES=true; shift ;;
     --dry-run)     DRY_RUN=true; shift ;;
-    *)             error "Unknown argument: $1\nUsage: $0 [--version X.Y.Z] [--url URL] [--relay|--bp] [--keep-config] [--fresh-db] [--dry-run]" ;;
+    *)             error "Unknown argument: $1\nUsage: $0 [--network mainnet|preprod|preview] [--version X.Y.Z] [--url URL] [--relay|--bp] [--keep-config|--refresh-config] [--fresh-db] [--ledger-backend V2InMemory|V2LSM] [--yes] [--dry-run]" ;;
   esac
 done
+
+case "${NETWORK}" in
+  mainnet)
+    CNODE_HOME="/opt/cardano/cnode"
+    SERVICE_NAME="cnode.service"
+    PROM_PORT="11798"
+    EXPECTED_NETWORK_MAGIC="764824073"
+    MITHRIL_NETWORK="release-mainnet"
+    ;;
+  preprod)
+    CNODE_HOME="/opt/cardano/preprod"
+    SERVICE_NAME="preprod.service"
+    PROM_PORT="12798"
+    EXPECTED_NETWORK_MAGIC="1"
+    MITHRIL_NETWORK="release-preprod"
+    ;;
+  preview)
+    CNODE_HOME="/opt/cardano/preview"
+    SERVICE_NAME="preview.service"
+    PROM_PORT="12718"
+    EXPECTED_NETWORK_MAGIC="2"
+    MITHRIL_NETWORK="release-preview"
+    ;;
+  *)
+    error "Unsupported network '${NETWORK}'. Expected mainnet, preprod, or preview."
+    ;;
+esac
+
+FILES_DIR="${CNODE_HOME}/files"
+DB_DIR="${CNODE_HOME}/db"
+ENV_FILE="${CNODE_HOME}/scripts/env"
+TOPOLOGY_FILE="${FILES_DIR}/topology.json"
+CONFIG_BASE_URL="https://book.world.dev.cardano.org/environments/${NETWORK}"
+
+read_env_value() {
+  local key="$1"
+  sed -n "s|^${key}=[\"']\{0,1\}\([^\"' #]*\).*$|\1|p" "${ENV_FILE}" | head -1
+}
+
+CONFIG_PROM_LINE=$(jq -r '.TraceOptions."".backends[]? | select(startswith("PrometheusSimple"))' "${FILES_DIR}/config.json" 2>/dev/null | head -1)
+CONFIG_PROM_BIND=""
+CONFIG_PROM_PORT=""
+if [[ -n "${CONFIG_PROM_LINE}" ]]; then
+  CONFIG_PROM_BIND=$(awk '{print $(NF-1)}' <<<"${CONFIG_PROM_LINE}")
+  CONFIG_PROM_PORT=$(awk '{print $NF}' <<<"${CONFIG_PROM_LINE}")
+fi
+ENV_PROM_BIND=$(read_env_value PROM_HOST)
+ENV_PROM_PORT=$(read_env_value PROM_PORT)
+PROM_BIND="${ENV_PROM_BIND:-${CONFIG_PROM_BIND:-${PROM_BIND}}}"
+PROM_PORT="${ENV_PROM_PORT:-${CONFIG_PROM_PORT:-${PROM_PORT}}}"
+
+[[ "${PROM_PORT}" =~ ^[0-9]+$ ]] || error "Could not determine existing Prometheus port from ${ENV_FILE} or config.json"
+
+info "Network:        ${NETWORK}"
+info "Node home:      ${CNODE_HOME}"
+info "Service:        ${SERVICE_NAME}"
+
+[[ -s "${TOPOLOGY_FILE}" ]] || error "Missing topology file: ${TOPOLOGY_FILE}"
+python3 -c "import json; value=json.load(open('${TOPOLOGY_FILE}')); assert isinstance(value, dict) and value" 2>/dev/null \
+  || error "Existing topology is not a non-empty JSON object: ${TOPOLOGY_FILE}"
+TOPOLOGY_P2P=$(python3 - "${TOPOLOGY_FILE}" <<'PYEOF'
+import json, sys
+
+topology = json.load(open(sys.argv[1]))
+if isinstance(topology.get("Producers"), list):
+  print("false")
+elif isinstance(topology.get("localRoots"), list) and isinstance(topology.get("publicRoots"), list):
+  print("true")
+else:
+  raise SystemExit("unsupported topology structure")
+PYEOF
+) || error "Topology is neither legacy Producers nor P2P localRoots/publicRoots format"
+TOPOLOGY_HASH_BEFORE=$(sha256sum "${TOPOLOGY_FILE}" | awk '{print $1}')
+info "Topology:       protected (${TOPOLOGY_HASH_BEFORE}, P2P=${TOPOLOGY_P2P})"
 
 # --- Resolve target version --------------------------------------------------
 if [[ -z "${TARGET_VERSION}" ]]; then
@@ -303,16 +506,20 @@ if [[ -z "${TARGET_VERSION}" ]]; then
     echo ""
     echo -e "  ${CYAN}Latest GitHub release: ${LATEST}${NC}"
     echo ""
-    read -r -p "Upgrade to ${LATEST}? [Y/n]: " confirm
-    case "${confirm}" in
-      [nN]*)
-        read -r -p "Enter target version (e.g. 11.0.1): " TARGET_VERSION
-        [[ -z "${TARGET_VERSION}" ]] && error "No version specified"
-        ;;
-      *)
-        TARGET_VERSION="${LATEST}"
-        ;;
-    esac
+    if ${ASSUME_YES} || ${DRY_RUN}; then
+      TARGET_VERSION="${LATEST}"
+    else
+      read -r -p "Upgrade to ${LATEST}? [Y/n]: " confirm
+      case "${confirm}" in
+        [nN]*)
+          read -r -p "Enter target version (e.g. 11.1.2): " TARGET_VERSION
+          [[ -z "${TARGET_VERSION}" ]] && error "No version specified"
+          ;;
+        *)
+          TARGET_VERSION="${LATEST}"
+          ;;
+      esac
+    fi
   else
     warn "Could not detect latest version from GitHub API"
     # Fallback: try to detect from currently installed binary
@@ -333,8 +540,34 @@ if ! [[ "${TARGET_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   error "Invalid version format '${TARGET_VERSION}'. Expected X.Y.Z (e.g. 11.0.1)"
 fi
 
+version_at_least() {
+  printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+
+if ${KEEP_CONFIG} && version_at_least "${TARGET_VERSION}" "11.1.2"; then
+  jq -e '.TraceOptions."".backends | type == "array"' "${FILES_DIR}/config.json" >/dev/null 2>&1 \
+    || error "cardano-node ${TARGET_VERSION} requires current TraceOptions configuration; rerun with --refresh-config"
+  jq -e '.LedgerDB.Backend == "V2InMemory" or .LedgerDB.Backend == "V2LSM"' "${FILES_DIR}/config.json" >/dev/null 2>&1 \
+    || error "Preserved config must explicitly select LedgerDB.Backend; rerun with --refresh-config and --ledger-backend"
+  CONFIG_P2P=$(jq -r '.EnableP2P // false' "${FILES_DIR}/config.json")
+  [[ "${CONFIG_P2P}" == "${TOPOLOGY_P2P}" ]] \
+    || error "Preserved config EnableP2P=${CONFIG_P2P} does not match protected topology P2P=${TOPOLOGY_P2P}; use --refresh-config"
+  if [[ "${TOPOLOGY_P2P}" == "false" ]]; then
+    [[ "$(jq -r '.ConsensusMode // empty' "${FILES_DIR}/config.json")" == "PraosMode" ]] \
+      || error "Protected legacy topology requires ConsensusMode=PraosMode; use --refresh-config"
+  fi
+fi
+
 info "Target version: ${TARGET_VERSION}"
 info "Node role:      ${NODE_ROLE}"
+
+if [[ "${NETWORK}" == "mainnet" ]]; then
+  ACTIVE_BIN_DIR="${BIN_DIR}"
+else
+  ACTIVE_BIN_DIR="${HOME}/.local/cardano-node/${TARGET_VERSION}/bin"
+fi
+STAGED_BIN_DIR="${HOME}/tmp/cardano-node-${TARGET_VERSION}-$(uname -m)"
+info "Install path:   ${ACTIVE_BIN_DIR}"
 
 # --- Resolve download URL and architecture -----------------------------------
 ARCH=$(uname -m)
@@ -362,24 +595,42 @@ fi
 if ${KEEP_CONFIG}; then
   LEDGER_BACKEND="(unchanged)"
   info "LedgerDB backend: skipped (--keep-config)"
+elif [[ -n "${LEDGER_BACKEND}" ]]; then
+  [[ "${LEDGER_BACKEND}" == "V2InMemory" || "${LEDGER_BACKEND}" == "V2LSM" ]] \
+    || error "Invalid --ledger-backend '${LEDGER_BACKEND}'. Expected V2InMemory or V2LSM."
+  info "LedgerDB backend: ${LEDGER_BACKEND}"
 else
-  echo ""
-  echo -e "${GREEN}LedgerDB backend options:${NC}"
-  echo "  1) V2InMemory — ledger state in RAM (faster forging, higher memory ~16-24 GB)"
-  echo "  2) V2LSM      — ledger state on disk (lower memory ~4-8 GB, slightly higher latency)"
-  if [[ "${NODE_ROLE}" == "bp" ]]; then
-    echo -e "${YELLOW}[WARN]${NC}  V2InMemory is recommended for block producers to minimize forge latency."
+  CURRENT_BACKEND=$(python3 -c "
+import json
+try:
+    print(json.load(open('${FILES_DIR}/config.json')).get('LedgerDB', {}).get('Backend', ''))
+except Exception:
+    pass
+" 2>/dev/null) || CURRENT_BACKEND=""
+  if [[ -z "${CURRENT_BACKEND}" ]] && ! ${LEDGER_BACKEND_EXPLICIT}; then
+    error "Existing config has no LedgerDB backend. Select --ledger-backend V2InMemory or V2LSM explicitly for --refresh-config."
   fi
-  read -r -p "Choose backend [1=V2InMemory (default), 2=V2LSM]: " backend_choice
-  case "${backend_choice}" in
-    2)  LEDGER_BACKEND="V2LSM" ;;
-    *)  LEDGER_BACKEND="V2InMemory" ;;
-  esac
+  if ${ASSUME_YES} || ${DRY_RUN}; then
+    LEDGER_BACKEND="${CURRENT_BACKEND}"
+  else
+    echo ""
+    echo -e "${GREEN}LedgerDB backend options:${NC}"
+    echo "  1) V2InMemory - ledger state in RAM (faster forging, higher memory ~16-24 GB)"
+    echo "  2) V2LSM      - ledger state on disk (lower memory ~4-8 GB, slightly higher latency)"
+    if [[ "${NODE_ROLE}" == "bp" ]]; then
+      echo -e "${YELLOW}[WARN]${NC}  V2InMemory is recommended for block producers to minimize forge latency."
+    fi
+    read -r -p "Choose backend [1=V2InMemory (default), 2=V2LSM]: " backend_choice
+    case "${backend_choice}" in
+      2)  LEDGER_BACKEND="V2LSM" ;;
+      *)  LEDGER_BACKEND="V2InMemory" ;;
+    esac
+  fi
   info "LedgerDB backend: ${LEDGER_BACKEND}"
 fi
 
 # --- Smart DB decision (unless --fresh-db already set) -----------------------
-if ! ${FRESH_DB} && ! ${KEEP_CONFIG}; then
+if ! ${FRESH_DB} && ! ${KEEP_CONFIG} && ! ${ASSUME_YES} && ! ${DRY_RUN}; then
   # Detect current backend from existing config
   CURRENT_BACKEND=""
   if [[ -f "${FILES_DIR}/config.json" ]]; then
@@ -424,27 +675,26 @@ except: pass
   fi
 fi
 
-${DRY_RUN} && info "DRY RUN — no changes will be made"
+if ${DRY_RUN}; then
+  info "DRY RUN - no changes will be made"
+  info "Would download ${NODE_RELEASE_URL}"
+  if ${KEEP_CONFIG}; then
+    info "Would preserve config.json, genesis files, env, and topology.json"
+  else
+    info "Would refresh config/genesis from ${CONFIG_BASE_URL} while preserving the existing metrics endpoint"
+  fi
+  info "Would preserve database: $([[ "${FRESH_DB}" == "true" ]] && echo no || echo yes)"
+  info "Existing Prometheus endpoint: ${PROM_BIND}:${PROM_PORT}"
+  exit 0
+fi
 
 # --- Step 0: Download staged binaries ----------------------------------------
 info "Step 0: Downloading cardano-node ${TARGET_VERSION} binaries..."
 mkdir -p "${STAGED_BIN_DIR}"
-
-# Check if binaries already downloaded at the correct version
-SKIP_DOWNLOAD=false
-if [[ -x "${STAGED_BIN_DIR}/cardano-node" ]]; then
-  EXISTING_VER=$("${STAGED_BIN_DIR}/cardano-node" --version 2>/dev/null | head -1 | awk '{print $2}') || EXISTING_VER="unknown"
-  if [[ "${EXISTING_VER}" == "${TARGET_VERSION}" ]]; then
-    info "Binaries already staged (${EXISTING_VER}) — skipping download"
-    SKIP_DOWNLOAD=true
-  else
-    info "Staged binaries are ${EXISTING_VER}, need ${TARGET_VERSION} — re-downloading..."
-  fi
-fi
-
-if ! ${SKIP_DOWNLOAD}; then
-  DOWNLOAD_FILE=$(mktemp /tmp/cardano-node-XXXXXX)
-  trap 'rm -f "${DOWNLOAD_FILE}"' EXIT
+rm -rf "${STAGED_BIN_DIR}"
+mkdir -p "${STAGED_BIN_DIR}"
+DOWNLOAD_FILE=$(mktemp /tmp/cardano-node-XXXXXX)
+trap 'rm -f "${DOWNLOAD_FILE}"' EXIT
 
   # Verify URL is reachable before downloading
   HTTP_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L "${NODE_RELEASE_URL}" 2>/dev/null) || HTTP_CODE="000"
@@ -455,6 +705,7 @@ if ! ${SKIP_DOWNLOAD}; then
   info "Downloading..."
   curl -L --fail --progress-bar "${NODE_RELEASE_URL}" -o "${DOWNLOAD_FILE}" \
     || error "Download failed from ${NODE_RELEASE_URL}"
+  verify_cardano_archive_checksum "${DOWNLOAD_FILE}"
 
   # Clear staged directory for clean extraction
   rm -rf "${STAGED_BIN_DIR:?}"/*
@@ -483,16 +734,15 @@ if ! ${SKIP_DOWNLOAD}; then
     esac
   }
 
-  _extract "${DOWNLOAD_FILE}" "${STAGED_BIN_DIR}"
-  rm -f "${DOWNLOAD_FILE}"
-  trap - EXIT
+_extract "${DOWNLOAD_FILE}" "${STAGED_BIN_DIR}"
+rm -f "${DOWNLOAD_FILE}"
+trap - EXIT
 
-  # Handle tarballs that extract with a nested bin/ subdirectory (11.0.1+)
-  if [[ ! -x "${STAGED_BIN_DIR}/cardano-node" && -x "${STAGED_BIN_DIR}/bin/cardano-node" ]]; then
-    mv "${STAGED_BIN_DIR}"/bin/* "${STAGED_BIN_DIR}"/
-    rmdir "${STAGED_BIN_DIR}/bin" 2>/dev/null || true
-    rm -rf "${STAGED_BIN_DIR}/share" 2>/dev/null || true
-  fi
+# Handle tarballs that extract with a nested bin/ subdirectory (11.0.1+)
+if [[ ! -x "${STAGED_BIN_DIR}/cardano-node" && -x "${STAGED_BIN_DIR}/bin/cardano-node" ]]; then
+  mv "${STAGED_BIN_DIR}"/bin/* "${STAGED_BIN_DIR}"/
+  rmdir "${STAGED_BIN_DIR}/bin" 2>/dev/null || true
+  rm -rf "${STAGED_BIN_DIR}/share" 2>/dev/null || true
 fi
 
 info "Staged binaries ready in ${STAGED_BIN_DIR} ✓"
@@ -500,20 +750,31 @@ info "Staged binaries ready in ${STAGED_BIN_DIR} ✓"
 # --- Pre-flight checks -------------------------------------------------------
 [[ -d "${STAGED_BIN_DIR}" ]] || error "Staged binaries not found at ${STAGED_BIN_DIR}"
 [[ -x "${STAGED_BIN_DIR}/cardano-node" ]] || error "No cardano-node binary in ${STAGED_BIN_DIR}"
+[[ -x "${STAGED_BIN_DIR}/cardano-cli" ]] || error "No cardano-cli binary in ${STAGED_BIN_DIR}"
 
 STAGED_VERSION=$("${STAGED_BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
 if [[ "${STAGED_VERSION}" != "${TARGET_VERSION}" ]]; then
   error "Staged binary is ${STAGED_VERSION}, expected ${TARGET_VERSION}"
 fi
 info "Staged binary version verified: ${STAGED_VERSION}"
+STAGED_CLI_VERSION=$("${STAGED_BIN_DIR}/cardano-cli" --version | head -1 | awk '{print $2}')
+[[ -n "${STAGED_CLI_VERSION}" ]] || error "Staged cardano-cli did not report a version"
+info "Staged cardano-cli package version verified: ${STAGED_CLI_VERSION}"
 
-CURRENT_VERSION=$("${BIN_DIR}/cardano-node" --version 2>/dev/null | head -1 | awk '{print $2}') || CURRENT_VERSION="unknown"
+CURRENT_NODE_BIN="${BIN_DIR}/cardano-node"
+if [[ "${NETWORK}" != "mainnet" && -f "${ENV_FILE}" ]]; then
+  ENV_NODE_BIN=$(sed -n 's|^CNODEBIN="\{0,1\}\([^" ]*\)"\{0,1\}$|\1|p' "${ENV_FILE}" | head -1)
+  [[ -x "${ENV_NODE_BIN:-}" ]] && CURRENT_NODE_BIN="${ENV_NODE_BIN}"
+fi
+CURRENT_VERSION=$("${CURRENT_NODE_BIN}" --version 2>/dev/null | head -1 | awk '{print $2}') || CURRENT_VERSION="unknown"
 info "Current binary version: ${CURRENT_VERSION}"
 
 if [[ "${CURRENT_VERSION}" == "${TARGET_VERSION}" ]]; then
   warn "Already running ${TARGET_VERSION}."
-  read -r -p "Continue anyway? [y/N]: " confirm
-  [[ "${confirm}" =~ ^[yY] ]] || { info "Aborted."; exit 0; }
+  if ! ${ASSUME_YES}; then
+    read -r -p "Continue anyway? [y/N]: " confirm
+    [[ "${confirm}" =~ ^[yY] ]] || { info "Aborted."; exit 0; }
+  fi
 fi
 
 if ${DRY_RUN}; then
@@ -532,83 +793,87 @@ info "System dependencies installed ✓"
 
 # --- Step 2: Backup config files ---------------------------------------------
 info "Step 2: Backing up config files..."
-BACKUP_SUFFIX="${CURRENT_VERSION}-bak"
-if [[ -d "${FILES_DIR}-${BACKUP_SUFFIX}" ]]; then
-  warn "Backup already exists: ${FILES_DIR}-${BACKUP_SUFFIX} — skipping"
-else
-  cp -a "${FILES_DIR}" "${FILES_DIR}-${BACKUP_SUFFIX}"
-  info "Config backed up to ${FILES_DIR}-${BACKUP_SUFFIX} ✓"
-fi
+BACKUP_SUFFIX="${CURRENT_VERSION}-bak-$(date -u +%Y%m%dT%H%M%SZ)"
+cp -a "${FILES_DIR}" "${FILES_DIR}-${BACKUP_SUFFIX}"
+cp -a "${ENV_FILE}" "${ENV_FILE}-${BACKUP_SUFFIX}"
+info "Config backed up to ${FILES_DIR}-${BACKUP_SUFFIX} ✓"
+info "Guild environment backed up to ${ENV_FILE}-${BACKUP_SUFFIX} ✓"
 
 # --- Step 3: Backup current binaries -----------------------------------------
 info "Step 3: Backing up current binaries..."
-mkdir -p "${BACKUP_BIN_DIR}"
-for bin in cardano-node cardano-cli; do
-  if [[ -f "${BIN_DIR}/${bin}" ]]; then
-    DEST="${BACKUP_BIN_DIR}/${bin}-${CURRENT_VERSION}"
-    if [[ -f "${DEST}" ]]; then
-      warn "Binary backup already exists: ${DEST} — skipping"
-    else
-      cp "${BIN_DIR}/${bin}" "${DEST}"
-      info "Backed up ${bin} → ${DEST} ✓"
-    fi
+BINARY_BACKUP_DIR="${BACKUP_BIN_DIR}/${NETWORK}-${BACKUP_SUFFIX}"
+mkdir -p "${BINARY_BACKUP_DIR}"
+while IFS= read -r -d '' staged_file; do
+  binary_name=$(basename "${staged_file}")
+  if [[ -f "${ACTIVE_BIN_DIR}/${binary_name}" ]]; then
+    cp -a "${ACTIVE_BIN_DIR}/${binary_name}" "${BINARY_BACKUP_DIR}/${binary_name}"
   fi
-done
+done < <(find "${STAGED_BIN_DIR}" -maxdepth 1 -type f -print0)
+info "Existing binaries backed up to ${BINARY_BACKUP_DIR} ✓"
 
-# --- Step 4: Download updated genesis + checkpoints + config ----------------
+# --- Step 4: Stage official network configuration ----------------------------
 if ${KEEP_CONFIG}; then
   info "Step 4: --keep-config specified — skipping config/genesis download and patching"
 else
-  info "Step 4: Downloading updated genesis, checkpoints, and config..."
-  curl -sL "${CONWAY_GENESIS_URL}" -o "${FILES_DIR}/conway-genesis.json"
-  curl -sL "${CHECKPOINTS_URL}" -o "${FILES_DIR}/checkpoints.json"
+  info "Step 4: Staging official ${NETWORK} configuration..."
+  CONFIG_STAGE_DIR=$(mktemp -d)
+  curl -fsSL "${CONFIG_BASE_URL}/config.json" -o "${CONFIG_STAGE_DIR}/config.json"
 
-  # Verify downloads are valid JSON
-  for f in conway-genesis.json checkpoints.json; do
-    python3 -c "import json; json.load(open('${FILES_DIR}/${f}'))" 2>/dev/null \
-      || error "Downloaded ${f} is not valid JSON"
+  mapfile -t REFERENCED_FILES < <(python3 - "${CONFIG_STAGE_DIR}/config.json" <<'PYEOF'
+import json, os, sys
+c = json.load(open(sys.argv[1]))
+for key, value in c.items():
+    if key.endswith("File") and isinstance(value, str) and value.endswith(".json"):
+        print(os.path.basename(value))
+PYEOF
+  )
+  for file_name in "${REFERENCED_FILES[@]}"; do
+    [[ "$(basename "${file_name}")" != "topology.json" ]] \
+      || error "Refusing to stage protected topology.json from network config"
+    curl -fsSL "${CONFIG_BASE_URL}/${file_name}" -o "${CONFIG_STAGE_DIR}/${file_name}"
   done
-  info "Genesis and checkpoints updated ✓"
-
-  # --- Download and patch config.json ----------------------------------------
-  info "  Downloading official config.json and applying edits..."
-  curl -sL "${CONFIG_URL}" -o "${FILES_DIR}/config.json"
-
-  # Validate the download
-  python3 -c "import json; json.load(open('${FILES_DIR}/config.json'))" 2>/dev/null \
-    || error "Downloaded config.json is not valid JSON"
 
   # Apply all edits via Python for reliability
+  CONFIG_STAGE_DIR="${CONFIG_STAGE_DIR}" \
+  FILES_DIR="${FILES_DIR}" \
+  EXPECTED_NETWORK_MAGIC="${EXPECTED_NETWORK_MAGIC}" \
+  TOPOLOGY_P2P="${TOPOLOGY_P2P}" \
   PROM_BIND="${PROM_BIND}" \
   PROM_PORT="${PROM_PORT}" \
-  EKG_PORT="${EKG_PORT}" \
   LEDGER_BACKEND="${LEDGER_BACKEND}" \
   NODE_ROLE="${NODE_ROLE}" \
   python3 << 'PYEOF'
-import json, os
+import hashlib, json, os, pathlib
 
-config_path = os.path.join(os.environ.get("CNODE_HOME", "/opt/cardano/cnode"), "files", "config.json")
+stage_dir = pathlib.Path(os.environ["CONFIG_STAGE_DIR"])
+files_dir = pathlib.Path(os.environ["FILES_DIR"])
+config_path = stage_dir / "config.json"
 prom_bind = os.environ["PROM_BIND"]
 prom_port = int(os.environ["PROM_PORT"])
-ekg_port = int(os.environ["EKG_PORT"])
 ledger_backend = os.environ["LEDGER_BACKEND"]
 node_role = os.environ["NODE_ROLE"]
+topology_p2p = os.environ["TOPOLOGY_P2P"] == "true"
 
-with open(config_path) as f:
-    c = json.load(f)
+c = json.loads(config_path.read_text())
+
+for key, value in list(c.items()):
+  if key.endswith("File") and isinstance(value, str) and value.endswith(".json"):
+    c[key] = str(files_dir / pathlib.Path(value).name)
 
 # Guild Operators compat fields
-c["EnableP2P"] = True
-c["TraceChainDb"] = True
-c["hasEKG"] = ekg_port
-c["hasPrometheus"] = [prom_bind, prom_port]
+c["EnableP2P"] = topology_p2p
+c["PeerSharing"] = False
+if not topology_p2p:
+  c["ConsensusMode"] = "PraosMode"
 
 # Prometheus bind in TraceOptions
 backends = c.get("TraceOptions", {}).get("", {}).get("backends", [])
 c["TraceOptions"][""]["backends"] = [
-    b.replace("127.0.0.1", prom_bind) if "PrometheusSimple" in b else b
+  f"PrometheusSimple suffix {prom_bind} {prom_port}" if "PrometheusSimple" in b else b
     for b in backends
 ]
+if not any("PrometheusSimple" in b for b in c["TraceOptions"][""]["backends"]):
+  c["TraceOptions"][""]["backends"].append(f"PrometheusSimple suffix {prom_bind} {prom_port}")
 
 # LedgerDB backend
 if "LedgerDB" in c:
@@ -625,32 +890,57 @@ if node_role == "relay":
     if "Net.ConnectionManager.Remote" in to:
         to["Net.ConnectionManager.Remote"]["severity"] = "Info"
 
-with open(config_path, 'w') as f:
-    json.dump(c, f, indent=2)
-    f.write('\n')
+config_path.write_text(json.dumps(c, indent=2) + "\n")
+
+expected_magic = int(os.environ["EXPECTED_NETWORK_MAGIC"])
+shelley = json.loads((stage_dir / pathlib.Path(c["ShelleyGenesisFile"]).name).read_text())
+assert shelley["networkMagic"] == expected_magic, "network magic mismatch"
+
+if "CheckpointsFile" in c and "CheckpointsFileHash" in c:
+    data = (stage_dir / pathlib.Path(c["CheckpointsFile"]).name).read_bytes()
+    actual = hashlib.blake2b(data, digest_size=32).hexdigest()
+    assert actual == c["CheckpointsFileHash"], "CheckpointsFile hash mismatch"
 
 print("Config patched successfully")
 PYEOF
 
+  for genesis in byron shelley alonzo conway; do
+    hash_key="${genesis^}GenesisHash"
+    expected_hash=$(jq -r ".${hash_key}" "${CONFIG_STAGE_DIR}/config.json")
+    if [[ "${genesis}" == "byron" ]]; then
+      actual_hash=$("${STAGED_BIN_DIR}/cardano-cli" byron genesis print-genesis-hash \
+        --genesis-json "${CONFIG_STAGE_DIR}/${genesis}-genesis.json")
+    else
+      actual_hash=$("${STAGED_BIN_DIR}/cardano-cli" hash genesis-file \
+        --genesis "${CONFIG_STAGE_DIR}/${genesis}-genesis.json")
+    fi
+    [[ "${actual_hash}" == "${expected_hash}" ]] \
+      || error "${genesis^} genesis hash mismatch"
+  done
+
   # Validate final config
   python3 -c "
-import json, os
-config_path = os.path.join(os.environ.get('CNODE_HOME', '/opt/cardano/cnode'), 'files', 'config.json')
+import json
+config_path = '${CONFIG_STAGE_DIR}/config.json'
 c = json.load(open(config_path))
-assert c['UseTraceDispatcher'] == True, 'UseTraceDispatcher not true'
-assert c['TraceChainDb'] == True, 'TraceChainDb missing'
 assert c['LedgerDB']['Backend'] == '${LEDGER_BACKEND}', 'Wrong backend'
+assert c['EnableP2P'] is ${TOPOLOGY_P2P^}, 'Topology/P2P mode mismatch'
+if not c['EnableP2P']:
+  assert c['ConsensusMode'] == 'PraosMode', 'Legacy topology requires PraosMode'
 prom_line = [b for b in c['TraceOptions']['']['backends'] if 'PrometheusSimple' in b]
-assert len(prom_line) == 1 and '${PROM_BIND}' in prom_line[0], 'Prometheus bind wrong'
+assert prom_line == ['PrometheusSimple suffix ${PROM_BIND} ${PROM_PORT}'], 'Prometheus endpoint wrong'
 print('Config validation passed ✓')
 " || error "Config validation failed"
 
-  info "Config downloaded and patched ✓"
+  info "Official config, genesis hashes, network magic, and metrics validated ✓"
 fi
 
 # --- Step 5: Stop the node ---------------------------------------------------
 info "Step 5: Stopping ${SERVICE_NAME}..."
+ROLLBACK_ARMED=true
+trap rollback_on_exit EXIT
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
+  NODE_WAS_ACTIVE=true
   sudo systemctl stop "${SERVICE_NAME}"
   # Wait for clean shutdown
   for i in $(seq 1 12); do
@@ -665,15 +955,47 @@ else
   warn "Service was not running"
 fi
 
+# Install the fully validated configuration only after the node is stopped.
+if ! ${KEEP_CONFIG}; then
+  [[ ! -e "${CONFIG_STAGE_DIR}/topology.json" ]] \
+    || error "Refusing to install a staged topology.json"
+  while IFS= read -r -d '' config_file; do
+    config_name=$(basename "${config_file}")
+    CONFIG_INSTALLED_FILES+=("${config_name}")
+    cp -a "${config_file}" "${FILES_DIR}/${config_name}"
+  done < <(find "${CONFIG_STAGE_DIR}" -maxdepth 1 -type f ! -name topology.json -print0)
+  rm -rf "${CONFIG_STAGE_DIR}"
+  info "Validated ${NETWORK} configuration installed ✓"
+fi
+
+TOPOLOGY_HASH_AFTER=$(sha256sum "${TOPOLOGY_FILE}" | awk '{print $1}')
+[[ "${TOPOLOGY_HASH_AFTER}" == "${TOPOLOGY_HASH_BEFORE}" ]] \
+  || error "Protected topology changed unexpectedly; service will not be started"
+info "Protected topology unchanged ✓"
+
 # --- Step 6: Copy new binaries -----------------------------------------------
 info "Step 6: Installing new binaries..."
-cp "${STAGED_BIN_DIR}"/* "${BIN_DIR}/"
+mkdir -p "${ACTIVE_BIN_DIR}"
+while IFS= read -r -d '' staged_file; do
+  binary_name=$(basename "${staged_file}")
+  install -m 0755 "${staged_file}" "${ACTIVE_BIN_DIR}/.${binary_name}.new"
+  mv -f "${ACTIVE_BIN_DIR}/.${binary_name}.new" "${ACTIVE_BIN_DIR}/${binary_name}"
+done < <(find "${STAGED_BIN_DIR}" -maxdepth 1 -type f -print0)
 
-INSTALLED_VERSION=$("${BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
+INSTALLED_VERSION=$("${ACTIVE_BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
 if [[ "${INSTALLED_VERSION}" != "${TARGET_VERSION}" ]]; then
   error "Installed version ${INSTALLED_VERSION} != expected ${TARGET_VERSION}"
 fi
 info "Binaries installed: cardano-node ${INSTALLED_VERSION} ✓"
+
+if [[ "${NETWORK}" != "mainnet" ]]; then
+  ENV_CHANGED=true
+  set_env_value "${ENV_FILE}" CNODEBIN "${ACTIVE_BIN_DIR}/cardano-node"
+  if [[ -x "${ACTIVE_BIN_DIR}/cardano-cli" ]]; then
+    set_env_value "${ENV_FILE}" CCLI "${ACTIVE_BIN_DIR}/cardano-cli"
+  fi
+fi
+info "Guild binary settings updated; existing metrics settings preserved ✓"
 
 # --- Step 7: Handle database (keep or fresh Mithril) ------------------------
 if ${FRESH_DB}; then
@@ -684,14 +1006,10 @@ if ${FRESH_DB}; then
   check_snapshot_disk_space
 
   if [[ -d "${DB_DIR}" ]]; then
-    DB_BACKUP="${DB_DIR}-${CURRENT_VERSION}-bak"
-    if [[ -d "${DB_BACKUP}" ]]; then
-      warn "DB backup already exists: ${DB_BACKUP} — removing current DB"
-      rm -rf "${DB_DIR}"
-    else
-      mv "${DB_DIR}" "${DB_BACKUP}"
-      info "DB renamed to ${DB_BACKUP}"
-    fi
+    DB_BACKUP="${DB_DIR}-${BACKUP_SUFFIX}"
+    [[ ! -e "${DB_BACKUP}" ]] || error "Refusing to overwrite DB backup ${DB_BACKUP}"
+    mv "${DB_DIR}" "${DB_BACKUP}"
+    info "DB renamed to ${DB_BACKUP}"
   else
     warn "No database directory found at ${DB_DIR}"
   fi
@@ -707,7 +1025,7 @@ if ${FRESH_DB}; then
     warn "Official mithril-client deploy failed or unavailable, falling back to custom deploy script"
   fi
 
-  if [[ "${official_deploy_ok}" != "true" ]]; then
+  if [[ "${official_deploy_ok}" != "true" && "${NETWORK}" == "mainnet" ]]; then
     if [[ ! -x "${MITHRIL_SCRIPT}" ]]; then
       info "Mithril deploy script not found — downloading..."
       curl -sL "${MITHRIL_SCRIPT_URL}" -o "${MITHRIL_SCRIPT}"
@@ -719,6 +1037,8 @@ if ${FRESH_DB}; then
     info "Deploying fresh Mithril snapshot to ${DB_DIR} with fallback script..."
     "${MITHRIL_SCRIPT}" --path "${DB_DIR}" --yes
     info "Mithril snapshot deployed via fallback script ✓"
+  elif [[ "${official_deploy_ok}" != "true" ]]; then
+    error "Official Mithril snapshot deploy failed for ${NETWORK}; the mainnet-only fallback was not used"
   fi
 
   # Ensure db metadata file exists for node startup
@@ -749,32 +1069,76 @@ for i in $(seq 1 12); do
 done
 
 if ! ${STARTED}; then
-  # Could still be activating (replay from genesis takes time)
   STATUS=$(systemctl show -p ActiveState --value "${SERVICE_NAME}")
-  if [[ "${STATUS}" == "activating" ]]; then
-    warn "Service is still activating (likely replaying ledger from genesis)"
-    warn "This is expected with V2LSM backend — replay can take many hours"
-  else
-    error "Service did not start within 60 seconds (status: ${STATUS})"
-  fi
+  error "Service did not become active within 60 seconds (status: ${STATUS})"
 fi
 
 # --- Step 9: Validate -------------------------------------------------------
 info "Step 9: Validating..."
 
-# Check Prometheus
-sleep 5
-PROM_RESPONSE=$(curl -sf "http://localhost:${PROM_PORT}/metrics" 2>/dev/null | head -5) || true
-if [[ -n "${PROM_RESPONSE}" ]]; then
-  METRICS_VERSION=$(curl -sf "http://localhost:${PROM_PORT}/metrics" | grep 'cardano_node_metrics_cardano_build_info' | grep -oP '[ ,{]version="[^"]+' | cut -d'"' -f2 | head -1) || true
-  if [[ "${METRICS_VERSION}" == "${TARGET_VERSION}" ]]; then
-    info "Prometheus metrics serving version ${METRICS_VERSION} ✓"
-  else
-    warn "Prometheus responding but version='${METRICS_VERSION}' (expected ${TARGET_VERSION})"
+# Require the service and its public observability contract to remain healthy.
+METRICS_VERSION=""
+ACTIVE_PEERS=""
+METRICS_SLOT=""
+for i in $(seq 1 24); do
+  systemctl is-active --quiet "${SERVICE_NAME}" \
+    || error "Service stopped during post-upgrade validation"
+  PROM_RESPONSE=$(curl -sf --max-time 5 "http://localhost:${PROM_PORT}/metrics" 2>/dev/null) || PROM_RESPONSE=""
+  METRICS_VERSION=$(awk '/cardano_node_metrics_cardano_build_info/ && match($0, /version="[^"]+"/) { print substr($0, RSTART + 9, RLENGTH - 10); exit }' <<<"${PROM_RESPONSE}")
+  ACTIVE_PEERS=$(awk '$1 == "cardano_node_metrics_peerSelection_ActivePeers_int" { print int($2); exit }' <<<"${PROM_RESPONSE}")
+  METRICS_SLOT=$(awk '$1 == "cardano_node_metrics_slotNum_int" { print int($2); exit }' <<<"${PROM_RESPONSE}")
+  if [[ "${METRICS_VERSION}" == "${TARGET_VERSION}" \
+    && "${ACTIVE_PEERS}" =~ ^[0-9]+$ && "${ACTIVE_PEERS}" -gt 0 \
+    && "${METRICS_SLOT}" =~ ^[0-9]+$ && "${METRICS_SLOT}" -gt 0 ]]; then
+    break
   fi
+  sleep 5
+done
+[[ "${METRICS_VERSION}" == "${TARGET_VERSION}" ]] \
+  || error "Prometheus did not report target version ${TARGET_VERSION} within 120 seconds"
+info "Prometheus metrics serving version ${METRICS_VERSION} ✓"
+[[ "${ACTIVE_PEERS}" =~ ^[0-9]+$ && "${ACTIVE_PEERS}" -gt 0 ]] \
+  || error "Prometheus reported no active peers within 120 seconds"
+[[ "${METRICS_SLOT}" =~ ^[0-9]+$ && "${METRICS_SLOT}" -gt 0 ]] \
+  || error "Prometheus did not expose a valid current slot"
+info "Relay has ${ACTIVE_PEERS} active peer(s) ✓"
+
+SOCKET_PATH="${CNODE_HOME}/sockets/node.socket"
+NETWORK_ARGS=(--testnet-magic "${EXPECTED_NETWORK_MAGIC}")
+[[ "${NETWORK}" == "mainnet" ]] && NETWORK_ARGS=(--mainnet)
+[[ -x "${ACTIVE_BIN_DIR}/cardano-cli" ]] || error "Matching cardano-cli was not installed"
+TIP_JSON=""
+for i in $(seq 1 24); do
+  systemctl is-active --quiet "${SERVICE_NAME}" \
+    || error "Service stopped while waiting for the node socket"
+  if [[ -S "${SOCKET_PATH}" ]]; then
+    TIP_JSON=$(CARDANO_NODE_SOCKET_PATH="${SOCKET_PATH}" timeout 10s \
+      "${ACTIVE_BIN_DIR}/cardano-cli" query tip "${NETWORK_ARGS[@]}" 2>/dev/null) || TIP_JSON=""
+  fi
+  [[ -n "${TIP_JSON}" ]] && break
+  sleep 5
+done
+if [[ -n "${TIP_JSON}" ]]; then
+  TIP_BLOCK=$(jq -r '.block // 0' <<<"${TIP_JSON}")
+  TIP_SLOT=$(jq -r '.slot // 0' <<<"${TIP_JSON}")
+  SYNC_PROGRESS=$(jq -r '.syncProgress // "0"' <<<"${TIP_JSON}")
+  [[ "${TIP_BLOCK}" =~ ^[0-9]+$ && "${TIP_BLOCK}" -gt 0 ]] \
+    || error "Node socket returned an invalid block number"
+  [[ "${TIP_SLOT}" =~ ^[0-9]+$ && "${TIP_SLOT}" -gt 0 ]] \
+    || error "Node socket returned an invalid slot number"
+  awk -v progress="${SYNC_PROGRESS}" 'BEGIN { exit !(progress + 0 >= 99.99) }' \
+    || error "Node sync progress is ${SYNC_PROGRESS}%"
+  SLOT_DELTA=$((TIP_SLOT - METRICS_SLOT))
+  (( SLOT_DELTA < 0 )) && SLOT_DELTA=$(( -SLOT_DELTA ))
+  (( SLOT_DELTA <= 300 )) \
+    || error "Prometheus and socket slot values differ by ${SLOT_DELTA} slots"
+  info "Node socket healthy at block ${TIP_BLOCK}, slot ${TIP_SLOT}, sync ${SYNC_PROGRESS}% ✓"
 else
-  warn "Prometheus not responding yet on port ${PROM_PORT} (may still be initializing)"
+  error "Node socket query did not succeed within 120 seconds"
 fi
+
+ROLLBACK_ARMED=false
+trap - EXIT
 
 # Show recent logs
 echo ""
@@ -789,12 +1153,12 @@ info ""
 info "Post-upgrade checklist:"
 info "  1. Monitor sync: journalctl -u ${SERVICE_NAME} -f --no-hostname"
 info "  2. Check Prometheus: curl -s http://localhost:${PROM_PORT}/metrics | head -20"
-info "  3. Check gLiveView once synced: /opt/cardano/cnode/scripts/gLiveView.sh"
+info "  3. Check gLiveView once synced: ${CNODE_HOME}/scripts/gLiveView.sh"
 if ! ${FRESH_DB}; then
   info ""
   info "  ⚠️  If the node appears to be replaying from genesis (slot numbers starting"
   info "     from 0), the DB format may have changed. Re-run with --fresh-db:"
-  info "     $0 --version ${TARGET_VERSION} --${NODE_ROLE} --fresh-db"
+  info "     $0 --network ${NETWORK} --version ${TARGET_VERSION} --${NODE_ROLE} --fresh-db"
 fi
 if [[ "${NODE_ROLE}" == "relay" ]]; then
   info "  4. Verify OpenBlockPerf: journalctl -u ${SERVICE_NAME} --no-hostname | grep CompletedBlockFetch"
@@ -802,7 +1166,6 @@ fi
 info ""
 info "Rollback (if needed):"
 info "  sudo systemctl stop ${SERVICE_NAME}"
-info "  cp ${BACKUP_BIN_DIR}/cardano-node-${CURRENT_VERSION} ${BIN_DIR}/cardano-node"
-info "  cp ${BACKUP_BIN_DIR}/cardano-cli-${CURRENT_VERSION} ${BIN_DIR}/cardano-cli"
-info "  cp -a ${FILES_DIR}-${BACKUP_SUFFIX}/config.json ${FILES_DIR}/config.json"
+info "  sudo cp -a ${FILES_DIR}-${BACKUP_SUFFIX}/. ${FILES_DIR}/"
+info "  sudo cp -a ${ENV_FILE}-${BACKUP_SUFFIX} ${ENV_FILE}"
 info "  sudo systemctl start ${SERVICE_NAME}"
