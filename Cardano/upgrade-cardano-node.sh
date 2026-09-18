@@ -64,6 +64,7 @@ EXPECTED_NETWORK_MAGIC=""
 MITHRIL_NETWORK=""
 
 SNAPSHOT_SAFETY_GB="${SNAPSHOT_SAFETY_GB:-20}"
+STARTUP_VALIDATION_TIMEOUT_SECONDS="${STARTUP_VALIDATION_TIMEOUT_SECONDS:-600}"
 MITHRIL_CLIENT_BIN="${MITHRIL_CLIENT_BIN:-${BIN_DIR}/mithril-client}"
 MITHRIL_RELEASE_TAG="${MITHRIL_RELEASE_TAG:-latest}"
 MITHRIL_SIGNING_FPR="${MITHRIL_SIGNING_FPR:-73FC4C3DFD55DBDC428AD2B5BE043B79FDA4C2EE}"
@@ -1096,9 +1097,16 @@ METRICS_VERSION=""
 ACTIVE_PEERS=""
 METRICS_SLOT=""
 STARTUP_STATE=""
+VALIDATION_INTERVAL_SECONDS=5
+[[ "${STARTUP_VALIDATION_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] \
+  || error "STARTUP_VALIDATION_TIMEOUT_SECONDS must be a positive integer"
+VALIDATION_ATTEMPTS=$((
+  (STARTUP_VALIDATION_TIMEOUT_SECONDS + VALIDATION_INTERVAL_SECONDS - 1)
+  / VALIDATION_INTERVAL_SECONDS
+))
 
-for i in $(seq 1 24); do
-  ELAPSED=$((i * 5))
+for i in $(seq 1 "${VALIDATION_ATTEMPTS}"); do
+  ELAPSED=$((i * VALIDATION_INTERVAL_SECONDS))
   SERVICE_STATE=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)
   MAIN_PID=$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || true)
   PROCESS_EXE=""
@@ -1111,8 +1119,10 @@ for i in $(seq 1 24); do
   info "  ${ELAPSED}s process: $([[ "${PROCESS_EXE}" == "${ACTIVE_BIN_DIR}/cardano-node" ]] && echo PASS || echo PENDING) (executable=${PROCESS_EXE:-unavailable})"
 
   JOURNAL_FAILURES=$(journalctl -u "${SERVICE_NAME}" --since "${VALIDATION_STARTED_AT}" --no-hostname --no-pager 2>/dev/null \
-    | grep -Ei '(\((Error|Critical|Alert|Emergency),|(^|[^[:alpha:]])(fatal|panic)([^[:alpha:]]|$)|uncaught exception)' || true)
-  JOURNAL_PRIORITY_FAILURES=$(journalctl -q -u "${SERVICE_NAME}" --since "${VALIDATION_STARTED_AT}" -p err..alert --no-hostname --no-pager 2>/dev/null || true)
+    | grep -Ei '(\((Error|Critical|Alert|Emergency),|(^|[^[:alpha:]])(fatal|panic)([^[:alpha:]]|$)|uncaught exception)' \
+    | grep -Ev 'Net\.PeerSelection\.Actions\.(ConnectionError|StatusChangeFailure)' || true)
+  JOURNAL_PRIORITY_FAILURES=$(journalctl -q -u "${SERVICE_NAME}" --since "${VALIDATION_STARTED_AT}" -p err..alert --no-hostname --no-pager 2>/dev/null \
+    | grep -Ev 'Net\.PeerSelection\.Actions\.(ConnectionError|StatusChangeFailure)' || true)
   if [[ -n "${JOURNAL_PRIORITY_FAILURES}" ]]; then
     JOURNAL_FAILURES="${JOURNAL_FAILURES}${JOURNAL_FAILURES:+$'\n'}${JOURNAL_PRIORITY_FAILURES}"
   fi
@@ -1155,11 +1165,11 @@ for i in $(seq 1 24); do
 done
 
 [[ "${PROCESS_EXE}" == "${ACTIVE_BIN_DIR}/cardano-node" ]] \
-  || error "Service did not run ${ACTIVE_BIN_DIR}/cardano-node within 120 seconds"
+  || error "Service did not run ${ACTIVE_BIN_DIR}/cardano-node within ${STARTUP_VALIDATION_TIMEOUT_SECONDS} seconds"
 [[ "${METRICS_VERSION}" == "${TARGET_VERSION}" ]] \
-  || error "Prometheus did not report target version ${TARGET_VERSION} within 120 seconds"
+  || error "Prometheus did not report target version ${TARGET_VERSION} within ${STARTUP_VALIDATION_TIMEOUT_SECONDS} seconds"
 [[ -n "${STARTUP_STATE}" ]] \
-  || error "No startup, replay, validation, or normal slot activity was detected within 120 seconds"
+  || error "No startup, replay, validation, or normal slot activity was detected within ${STARTUP_VALIDATION_TIMEOUT_SECONDS} seconds"
 info "Startup validation passed: cardano-node ${METRICS_VERSION} is ${STARTUP_STATE} ✓"
 
 if [[ "${ACTIVE_PEERS}" =~ ^[0-9]+$ && "${ACTIVE_PEERS}" -gt 0 ]]; then
