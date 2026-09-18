@@ -1050,6 +1050,7 @@ fi
 # --- Step 8: Start the node --------------------------------------------------
 info "Step 8: Starting ${SERVICE_NAME}..."
 sudo systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
+VALIDATION_STARTED_AT=$(date --iso-8601=seconds)
 sudo systemctl start "${SERVICE_NAME}"
 
 # Wait for service to become active or show early failure
@@ -1074,67 +1075,99 @@ if ! ${STARTED}; then
 fi
 
 # --- Step 9: Validate -------------------------------------------------------
-info "Step 9: Validating..."
-
-# Require the service and its public observability contract to remain healthy.
+info "Step 9: Validating upgraded node startup..."
 METRICS_VERSION=""
 ACTIVE_PEERS=""
 METRICS_SLOT=""
+STARTUP_STATE=""
+
 for i in $(seq 1 24); do
-  systemctl is-active --quiet "${SERVICE_NAME}" \
-    || error "Service stopped during post-upgrade validation"
+  ELAPSED=$((i * 5))
+  SERVICE_STATE=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)
+  MAIN_PID=$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || true)
+  PROCESS_EXE=""
+  if [[ "${MAIN_PID}" =~ ^[1-9][0-9]*$ ]]; then
+    PROCESS_EXE=$(readlink -f "/proc/${MAIN_PID}/exe" 2>/dev/null || true)
+  fi
+
+  info "  ${ELAPSED}s service: $([[ "${SERVICE_STATE}" == "active" ]] && echo PASS || echo FAIL) (state=${SERVICE_STATE:-unknown}, pid=${MAIN_PID:-unavailable})"
+  [[ "${SERVICE_STATE}" == "active" ]] || error "Service stopped during post-upgrade validation"
+  info "  ${ELAPSED}s process: $([[ "${PROCESS_EXE}" == "${ACTIVE_BIN_DIR}/cardano-node" ]] && echo PASS || echo PENDING) (executable=${PROCESS_EXE:-unavailable})"
+
+  JOURNAL_FAILURES=$(journalctl -u "${SERVICE_NAME}" --since "${VALIDATION_STARTED_AT}" --no-hostname --no-pager 2>/dev/null \
+    | grep -Ei '(\((Error|Critical|Alert|Emergency),|(^|[^[:alpha:]])(fatal|panic)([^[:alpha:]]|$)|uncaught exception)' || true)
+  JOURNAL_PRIORITY_FAILURES=$(journalctl -q -u "${SERVICE_NAME}" --since "${VALIDATION_STARTED_AT}" -p err..alert --no-hostname --no-pager 2>/dev/null || true)
+  if [[ -n "${JOURNAL_PRIORITY_FAILURES}" ]]; then
+    JOURNAL_FAILURES="${JOURNAL_FAILURES}${JOURNAL_FAILURES:+$'\n'}${JOURNAL_PRIORITY_FAILURES}"
+  fi
+  if [[ -n "${JOURNAL_FAILURES}" ]]; then
+    echo "${JOURNAL_FAILURES}" >&2
+    error "Fatal/error journal entries detected after starting the upgraded node"
+  fi
+  info "  ${ELAPSED}s journal errors: PASS (none detected)"
+
   PROM_RESPONSE=$(curl -sf --max-time 5 "http://localhost:${PROM_PORT}/metrics" 2>/dev/null) || PROM_RESPONSE=""
   METRICS_VERSION=$(awk '/cardano_node_metrics_cardano_build_info/ && match($0, /version="[^"]+"/) { print substr($0, RSTART + 9, RLENGTH - 10); exit }' <<<"${PROM_RESPONSE}")
   ACTIVE_PEERS=$(awk '$1 == "cardano_node_metrics_peerSelection_ActivePeers_int" { print int($2); exit }' <<<"${PROM_RESPONSE}")
   METRICS_SLOT=$(awk '$1 == "cardano_node_metrics_slotNum_int" { print int($2); exit }' <<<"${PROM_RESPONSE}")
-  if [[ "${METRICS_VERSION}" == "${TARGET_VERSION}" \
-    && "${ACTIVE_PEERS}" =~ ^[0-9]+$ && "${ACTIVE_PEERS}" -gt 0 \
-    && "${METRICS_SLOT}" =~ ^[0-9]+$ && "${METRICS_SLOT}" -gt 0 ]]; then
+  info "  ${ELAPSED}s metrics: $([[ "${METRICS_VERSION}" == "${TARGET_VERSION}" ]] && echo PASS || echo PENDING) (version=${METRICS_VERSION:-unavailable}, slot=${METRICS_SLOT:-unavailable}, activePeers=${ACTIVE_PEERS:-unavailable})"
+
+  REPLAY_LINE=$(journalctl -u "${SERVICE_NAME}" --since "${VALIDATION_STARTED_AT}" --no-hostname --no-pager 2>/dev/null \
+    | grep -E 'LedgerReplay|ChainDB\.ImmDbEvent\.ChunkValidation' | tail -1 || true)
+  REPLAY_PROGRESS=$(awk 'match($0, /Progress: [0-9.]+%/) { print substr($0, RSTART, RLENGTH) }' <<<"${REPLAY_LINE}")
+
+  if [[ "${METRICS_SLOT}" =~ ^[0-9]+$ && "${METRICS_SLOT}" -gt 0 ]]; then
+    STARTUP_STATE="ready"
+    info "  ${ELAPSED}s node activity: PASS (state=${STARTUP_STATE}, slot=${METRICS_SLOT})"
+  elif [[ -n "${REPLAY_LINE}" ]]; then
+    STARTUP_STATE="replaying/validating"
+    info "  ${ELAPSED}s node activity: PASS (state=${STARTUP_STATE}, ${REPLAY_PROGRESS:-journal activity detected})"
+  elif [[ "${METRICS_SLOT}" == "0" ]]; then
+    STARTUP_STATE="starting"
+    info "  ${ELAPSED}s node activity: PASS (state=${STARTUP_STATE}; equivalent to gLiveView slotNum=0)"
+  else
+    STARTUP_STATE=""
+    info "  ${ELAPSED}s node activity: PENDING (waiting for metrics or replay journal activity)"
+  fi
+
+  if [[ "${PROCESS_EXE}" == "${ACTIVE_BIN_DIR}/cardano-node" \
+    && "${METRICS_VERSION}" == "${TARGET_VERSION}" \
+    && -n "${STARTUP_STATE}" ]]; then
     break
   fi
   sleep 5
 done
+
+[[ "${PROCESS_EXE}" == "${ACTIVE_BIN_DIR}/cardano-node" ]] \
+  || error "Service did not run ${ACTIVE_BIN_DIR}/cardano-node within 120 seconds"
 [[ "${METRICS_VERSION}" == "${TARGET_VERSION}" ]] \
   || error "Prometheus did not report target version ${TARGET_VERSION} within 120 seconds"
-info "Prometheus metrics serving version ${METRICS_VERSION} ✓"
-[[ "${ACTIVE_PEERS}" =~ ^[0-9]+$ && "${ACTIVE_PEERS}" -gt 0 ]] \
-  || error "Prometheus reported no active peers within 120 seconds"
-[[ "${METRICS_SLOT}" =~ ^[0-9]+$ && "${METRICS_SLOT}" -gt 0 ]] \
-  || error "Prometheus did not expose a valid current slot"
-info "Relay has ${ACTIVE_PEERS} active peer(s) ✓"
+[[ -n "${STARTUP_STATE}" ]] \
+  || error "No startup, replay, validation, or normal slot activity was detected within 120 seconds"
+info "Startup validation passed: cardano-node ${METRICS_VERSION} is ${STARTUP_STATE} ✓"
+
+if [[ "${ACTIVE_PEERS}" =~ ^[0-9]+$ && "${ACTIVE_PEERS}" -gt 0 ]]; then
+  info "  Peer observation: PASS (${ACTIVE_PEERS} active peer(s))"
+else
+  warn "Peer observation: PENDING (${ACTIVE_PEERS:-unavailable} active peers; expected while ${STARTUP_STATE})"
+fi
 
 SOCKET_PATH="${CNODE_HOME}/sockets/node.socket"
 NETWORK_ARGS=(--testnet-magic "${EXPECTED_NETWORK_MAGIC}")
 [[ "${NETWORK}" == "mainnet" ]] && NETWORK_ARGS=(--mainnet)
 [[ -x "${ACTIVE_BIN_DIR}/cardano-cli" ]] || error "Matching cardano-cli was not installed"
 TIP_JSON=""
-for i in $(seq 1 24); do
-  systemctl is-active --quiet "${SERVICE_NAME}" \
-    || error "Service stopped while waiting for the node socket"
-  if [[ -S "${SOCKET_PATH}" ]]; then
-    TIP_JSON=$(CARDANO_NODE_SOCKET_PATH="${SOCKET_PATH}" timeout 10s \
-      "${ACTIVE_BIN_DIR}/cardano-cli" query tip "${NETWORK_ARGS[@]}" 2>/dev/null) || TIP_JSON=""
-  fi
-  [[ -n "${TIP_JSON}" ]] && break
-  sleep 5
-done
+if [[ -S "${SOCKET_PATH}" ]]; then
+  TIP_JSON=$(CARDANO_NODE_SOCKET_PATH="${SOCKET_PATH}" timeout 10s \
+    "${ACTIVE_BIN_DIR}/cardano-cli" query tip "${NETWORK_ARGS[@]}" 2>/dev/null) || TIP_JSON=""
+fi
 if [[ -n "${TIP_JSON}" ]]; then
   TIP_BLOCK=$(jq -r '.block // 0' <<<"${TIP_JSON}")
   TIP_SLOT=$(jq -r '.slot // 0' <<<"${TIP_JSON}")
   SYNC_PROGRESS=$(jq -r '.syncProgress // "0"' <<<"${TIP_JSON}")
-  [[ "${TIP_BLOCK}" =~ ^[0-9]+$ && "${TIP_BLOCK}" -gt 0 ]] \
-    || error "Node socket returned an invalid block number"
-  [[ "${TIP_SLOT}" =~ ^[0-9]+$ && "${TIP_SLOT}" -gt 0 ]] \
-    || error "Node socket returned an invalid slot number"
-  awk -v progress="${SYNC_PROGRESS}" 'BEGIN { exit !(progress + 0 >= 99.99) }' \
-    || error "Node sync progress is ${SYNC_PROGRESS}%"
-  SLOT_DELTA=$((TIP_SLOT - METRICS_SLOT))
-  (( SLOT_DELTA < 0 )) && SLOT_DELTA=$(( -SLOT_DELTA ))
-  (( SLOT_DELTA <= 300 )) \
-    || error "Prometheus and socket slot values differ by ${SLOT_DELTA} slots"
-  info "Node socket healthy at block ${TIP_BLOCK}, slot ${TIP_SLOT}, sync ${SYNC_PROGRESS}% ✓"
+  info "  Tip observation: PASS (block=${TIP_BLOCK}, slot=${TIP_SLOT}, syncProgress=${SYNC_PROGRESS}%)"
 else
-  error "Node socket query did not succeed within 120 seconds"
+  warn "Tip observation: PENDING (socket query unavailable while ${STARTUP_STATE})"
 fi
 
 ROLLBACK_ARMED=false
@@ -1153,12 +1186,11 @@ info ""
 info "Post-upgrade checklist:"
 info "  1. Monitor sync: journalctl -u ${SERVICE_NAME} -f --no-hostname"
 info "  2. Check Prometheus: curl -s http://localhost:${PROM_PORT}/metrics | head -20"
-info "  3. Check gLiveView once synced: ${CNODE_HOME}/scripts/gLiveView.sh"
+info "  3. Monitor startup/replay: ${CNODE_HOME}/scripts/gLiveView.sh"
 if ! ${FRESH_DB}; then
   info ""
-  info "  ⚠️  If the node appears to be replaying from genesis (slot numbers starting"
-  info "     from 0), the DB format may have changed. Re-run with --fresh-db:"
-  info "     $0 --network ${NETWORK} --version ${TARGET_VERSION} --${NODE_ROLE} --fresh-db"
+  info "  Replay/validation after an upgrade is expected and does not indicate failure."
+  info "  Do not use --fresh-db unless the release requires it or replay reports an error."
 fi
 if [[ "${NODE_ROLE}" == "relay" ]]; then
   info "  4. Verify OpenBlockPerf: journalctl -u ${SERVICE_NAME} --no-hostname | grep CompletedBlockFetch"
