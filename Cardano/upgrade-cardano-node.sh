@@ -595,6 +595,18 @@ else
   info "Download URL:   ${NODE_RELEASE_URL}"
 fi
 
+CURRENT_NODE_BIN="${ACTIVE_BIN_DIR}/cardano-node"
+CURRENT_CLI_BIN="${ACTIVE_BIN_DIR}/cardano-cli"
+if [[ "${NETWORK}" != "mainnet" && -f "${ENV_FILE}" ]]; then
+  ENV_NODE_BIN=$(sed -n 's|^CNODEBIN="\{0,1\}\([^" ]*\)"\{0,1\}$|\1|p' "${ENV_FILE}" | head -1)
+  [[ -x "${ENV_NODE_BIN:-}" ]] && CURRENT_NODE_BIN="${ENV_NODE_BIN}"
+fi
+CURRENT_VERSION=$("${CURRENT_NODE_BIN}" --version 2>/dev/null | head -1 | awk '{print $2}') || CURRENT_VERSION="unknown"
+REUSE_INSTALLED_BINARIES=false
+if [[ -z "${CUSTOM_URL}" && "${CURRENT_VERSION}" == "${TARGET_VERSION}" && -x "${CURRENT_CLI_BIN}" ]]; then
+  REUSE_INSTALLED_BINARIES=true
+fi
+
 # --- Choose LedgerDB backend -------------------------------------------------
 if ${KEEP_CONFIG}; then
   LEDGER_BACKEND="(unchanged)"
@@ -684,7 +696,11 @@ fi
 
 if ${DRY_RUN}; then
   info "DRY RUN - no changes will be made"
-  info "Would download ${NODE_RELEASE_URL}"
+  if ${REUSE_INSTALLED_BINARIES}; then
+    info "Would reuse installed cardano-node and cardano-cli for ${TARGET_VERSION}"
+  else
+    info "Would download ${NODE_RELEASE_URL}"
+  fi
   if ${KEEP_CONFIG}; then
     info "Would preserve config.json, genesis files, env, and topology.json"
   else
@@ -696,12 +712,18 @@ if ${DRY_RUN}; then
 fi
 
 # --- Step 0: Download staged binaries ----------------------------------------
-info "Step 0: Downloading cardano-node ${TARGET_VERSION} binaries..."
 mkdir -p "${STAGED_BIN_DIR}"
 rm -rf "${STAGED_BIN_DIR}"
 mkdir -p "${STAGED_BIN_DIR}"
-DOWNLOAD_FILE=$(mktemp /tmp/cardano-node-XXXXXX)
-trap 'rm -f "${DOWNLOAD_FILE}"' EXIT
+
+if ${REUSE_INSTALLED_BINARIES}; then
+  info "Step 0: Reusing installed cardano-node ${TARGET_VERSION} binaries..."
+  install -m 0755 "${CURRENT_NODE_BIN}" "${STAGED_BIN_DIR}/cardano-node"
+  install -m 0755 "${CURRENT_CLI_BIN}" "${STAGED_BIN_DIR}/cardano-cli"
+else
+  info "Step 0: Downloading cardano-node ${TARGET_VERSION} binaries..."
+  DOWNLOAD_FILE=$(mktemp /tmp/cardano-node-XXXXXX)
+  trap 'rm -f "${DOWNLOAD_FILE}"' EXIT
 
   # Verify URL is reachable before downloading
   HTTP_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L "${NODE_RELEASE_URL}" 2>/dev/null) || HTTP_CODE="000"
@@ -744,6 +766,7 @@ trap 'rm -f "${DOWNLOAD_FILE}"' EXIT
 _extract "${DOWNLOAD_FILE}" "${STAGED_BIN_DIR}"
 rm -f "${DOWNLOAD_FILE}"
 trap - EXIT
+fi
 
 # Handle tarballs that extract with a nested bin/ subdirectory (11.0.1+)
 if [[ ! -x "${STAGED_BIN_DIR}/cardano-node" && -x "${STAGED_BIN_DIR}/bin/cardano-node" ]]; then
@@ -768,12 +791,6 @@ STAGED_CLI_VERSION=$("${STAGED_BIN_DIR}/cardano-cli" --version | head -1 | awk '
 [[ -n "${STAGED_CLI_VERSION}" ]] || error "Staged cardano-cli did not report a version"
 info "Staged cardano-cli package version verified: ${STAGED_CLI_VERSION}"
 
-CURRENT_NODE_BIN="${BIN_DIR}/cardano-node"
-if [[ "${NETWORK}" != "mainnet" && -f "${ENV_FILE}" ]]; then
-  ENV_NODE_BIN=$(sed -n 's|^CNODEBIN="\{0,1\}\([^" ]*\)"\{0,1\}$|\1|p' "${ENV_FILE}" | head -1)
-  [[ -x "${ENV_NODE_BIN:-}" ]] && CURRENT_NODE_BIN="${ENV_NODE_BIN}"
-fi
-CURRENT_VERSION=$("${CURRENT_NODE_BIN}" --version 2>/dev/null | head -1 | awk '{print $2}') || CURRENT_VERSION="unknown"
 info "Current binary version: ${CURRENT_VERSION}"
 
 if [[ "${CURRENT_VERSION}" == "${TARGET_VERSION}" ]]; then
