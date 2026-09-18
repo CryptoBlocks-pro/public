@@ -544,9 +544,26 @@ version_at_least() {
   printf '%s\n%s\n' "$2" "$1" | sort -V -C
 }
 
+info "Target version: ${TARGET_VERSION}"
+info "Node role:      ${NODE_ROLE}"
+
+CURRENT_BACKEND=$(jq -r '.LedgerDB.Backend // empty' "${FILES_DIR}/config.json" 2>/dev/null) || CURRENT_BACKEND=""
+[[ "${CURRENT_BACKEND}" == "V2InMemory" || "${CURRENT_BACKEND}" == "V2LSM" ]] \
+  || error "Existing config has no valid LedgerDB backend. Expected V2InMemory or V2LSM."
+info "Current LedgerDB backend: ${CURRENT_BACKEND}"
+
 if ${KEEP_CONFIG} && version_at_least "${TARGET_VERSION}" "11.1.2"; then
   jq -e '.TraceOptions."".backends | type == "array"' "${FILES_DIR}/config.json" >/dev/null 2>&1 \
     || error "cardano-node ${TARGET_VERSION} requires current TraceOptions configuration; rerun with --refresh-config"
+  LEGACY_TRACER_KEYS=$(jq -r '
+    . as $config
+    |
+    ["TurnOnLogging", "TurnOnLogMetrics", "UseTraceDispatcher"]
+    | map(select(. as $key | $config | has($key)))
+    | join(", ")
+  ' "${FILES_DIR}/config.json")
+  [[ -z "${LEGACY_TRACER_KEYS}" ]] \
+    || error "Preserved config contains unsupported legacy tracer keys (${LEGACY_TRACER_KEYS}); rerun with --refresh-config"
   jq -e '.LedgerDB.Backend == "V2InMemory" or .LedgerDB.Backend == "V2LSM"' "${FILES_DIR}/config.json" >/dev/null 2>&1 \
     || error "Preserved config must explicitly select LedgerDB.Backend; rerun with --refresh-config and --ledger-backend"
   if [[ "${NODE_ROLE}" == "bp" ]]; then
@@ -561,9 +578,6 @@ if ${KEEP_CONFIG} && version_at_least "${TARGET_VERSION}" "11.1.2"; then
       || error "Protected legacy topology requires ConsensusMode=PraosMode; use --refresh-config"
   fi
 fi
-
-info "Target version: ${TARGET_VERSION}"
-info "Node role:      ${NODE_ROLE}"
 
 if [[ "${NETWORK}" == "mainnet" ]]; then
   ACTIVE_BIN_DIR="${BIN_DIR}"
@@ -608,24 +622,20 @@ if [[ -z "${CUSTOM_URL}" && "${CURRENT_VERSION}" == "${TARGET_VERSION}" && -x "$
 fi
 
 # --- Choose LedgerDB backend -------------------------------------------------
-if ${KEEP_CONFIG}; then
-  LEDGER_BACKEND="(unchanged)"
-  info "LedgerDB backend: skipped (--keep-config)"
-elif [[ -n "${LEDGER_BACKEND}" ]]; then
+if ${LEDGER_BACKEND_EXPLICIT}; then
   [[ "${LEDGER_BACKEND}" == "V2InMemory" || "${LEDGER_BACKEND}" == "V2LSM" ]] \
     || error "Invalid --ledger-backend '${LEDGER_BACKEND}'. Expected V2InMemory or V2LSM."
+fi
+
+if ${KEEP_CONFIG}; then
+  if ${LEDGER_BACKEND_EXPLICIT} && [[ "${LEDGER_BACKEND}" != "${CURRENT_BACKEND}" ]]; then
+    error "Changing LedgerDB backend requires --refresh-config (current: ${CURRENT_BACKEND}, requested: ${LEDGER_BACKEND})."
+  fi
+  LEDGER_BACKEND="${CURRENT_BACKEND}"
+  info "LedgerDB backend: ${LEDGER_BACKEND} (unchanged)"
+elif [[ -n "${LEDGER_BACKEND}" ]]; then
   info "LedgerDB backend: ${LEDGER_BACKEND}"
 else
-  CURRENT_BACKEND=$(python3 -c "
-import json
-try:
-    print(json.load(open('${FILES_DIR}/config.json')).get('LedgerDB', {}).get('Backend', ''))
-except Exception:
-    pass
-" 2>/dev/null) || CURRENT_BACKEND=""
-  if [[ -z "${CURRENT_BACKEND}" ]] && ! ${LEDGER_BACKEND_EXPLICIT}; then
-    error "Existing config has no LedgerDB backend. Select --ledger-backend V2InMemory or V2LSM explicitly for --refresh-config."
-  fi
   if ${ASSUME_YES} || ${DRY_RUN}; then
     LEDGER_BACKEND="${CURRENT_BACKEND}"
   elif [[ "${NODE_ROLE}" == "bp" ]]; then
@@ -649,49 +659,31 @@ if ! ${KEEP_CONFIG} && [[ "${NODE_ROLE}" == "bp" && "${LEDGER_BACKEND}" != "V2In
 fi
 
 # --- Smart DB decision (unless --fresh-db already set) -----------------------
-if ! ${FRESH_DB} && ! ${KEEP_CONFIG} && ! ${ASSUME_YES} && ! ${DRY_RUN}; then
-  # Detect current backend from existing config
-  CURRENT_BACKEND=""
-  if [[ -f "${FILES_DIR}/config.json" ]]; then
-    CURRENT_BACKEND=$(python3 -c "
-import json
-try:
-    c = json.load(open('${FILES_DIR}/config.json'))
-    print(c.get('LedgerDB', {}).get('Backend', ''))
-except: pass
-" 2>/dev/null) || CURRENT_BACKEND=""
-  fi
-
-  RECOMMEND_FRESH=false
-  FRESH_REASON=""
-
-  # Check for backend change
-  if [[ -n "${CURRENT_BACKEND}" && "${CURRENT_BACKEND}" != "${LEDGER_BACKEND}" ]]; then
-    RECOMMEND_FRESH=true
-    FRESH_REASON="Backend changing from ${CURRENT_BACKEND} → ${LEDGER_BACKEND} (ledger format incompatible)"
-  fi
-
+if [[ "${CURRENT_BACKEND}" != "${LEDGER_BACKEND}" ]]; then
   echo ""
-  if ${RECOMMEND_FRESH}; then
-    echo -e "${YELLOW}[WARN]${NC}  ${FRESH_REASON}"
-    echo -e "${YELLOW}[WARN]${NC}  A fresh Mithril snapshot is recommended to avoid hours of ledger replay."
-    echo ""
-    echo "  1) Deploy fresh Mithril snapshot (recommended)"
-    echo "  2) Keep existing database"
-    read -r -p "Choose [1=fresh (default), 2=keep]: " db_choice
-    case "${db_choice}" in
-      2)  info "Keeping existing database" ;;
-      *)  FRESH_DB=true; info "Will deploy fresh Mithril snapshot" ;;
-    esac
+  warn "LedgerDB backend changing from ${CURRENT_BACKEND} to ${LEDGER_BACKEND}."
+  warn "The ledger formats are incompatible; a fresh database is required."
+  if ${DRY_RUN}; then
+    FRESH_DB=true
+    info "Dry run: would deploy a fresh Mithril snapshot"
+  elif ${FRESH_DB} || ${ASSUME_YES}; then
+    FRESH_DB=true
+    info "Will deploy a fresh Mithril snapshot"
   else
-    echo "  1) Keep existing database (recommended — same backend, minor upgrade)"
-    echo "  2) Deploy fresh Mithril snapshot"
-    read -r -p "Choose [1=keep (default), 2=fresh]: " db_choice
-    case "${db_choice}" in
-      2)  FRESH_DB=true; info "Will deploy fresh Mithril snapshot" ;;
-      *)  info "Keeping existing database" ;;
-    esac
+    read -r -p "Continue and deploy a fresh Mithril snapshot? [y/N]: " confirm
+    [[ "${confirm}" =~ ^[yY] ]] || { info "Aborted."; exit 0; }
+    FRESH_DB=true
+    info "Will deploy a fresh Mithril snapshot"
   fi
+elif ! ${FRESH_DB} && ! ${KEEP_CONFIG} && ! ${ASSUME_YES} && ! ${DRY_RUN}; then
+  echo ""
+  echo "  1) Keep existing database (recommended — same backend, minor upgrade)"
+  echo "  2) Deploy fresh Mithril snapshot"
+  read -r -p "Choose [1=keep (default), 2=fresh]: " db_choice
+  case "${db_choice}" in
+    2)  FRESH_DB=true; info "Will deploy fresh Mithril snapshot" ;;
+    *)  info "Keeping existing database" ;;
+  esac
 fi
 
 if ${DRY_RUN}; then
