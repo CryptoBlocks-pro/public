@@ -31,7 +31,7 @@ set -euo pipefail
 #   --keep-config  Preserve config/genesis files (default)
 #   --refresh-config Download current official config/genesis files and apply local metrics
 #   --fresh-db     Backup DB and deploy fresh Mithril snapshot (use for DB-breaking upgrades)
-#   --ledger-backend V2InMemory|V2LSM (default: current backend, or V2InMemory)
+#   --ledger-backend V2InMemory|V2LSM (block producers require V2InMemory)
 #   --yes          Accept recommended defaults without prompting
 #   --dry-run      Show what would be done without making changes
 #
@@ -549,6 +549,10 @@ if ${KEEP_CONFIG} && version_at_least "${TARGET_VERSION}" "11.1.2"; then
     || error "cardano-node ${TARGET_VERSION} requires current TraceOptions configuration; rerun with --refresh-config"
   jq -e '.LedgerDB.Backend == "V2InMemory" or .LedgerDB.Backend == "V2LSM"' "${FILES_DIR}/config.json" >/dev/null 2>&1 \
     || error "Preserved config must explicitly select LedgerDB.Backend; rerun with --refresh-config and --ledger-backend"
+  if [[ "${NODE_ROLE}" == "bp" ]]; then
+    jq -e '.LedgerDB.Backend == "V2InMemory"' "${FILES_DIR}/config.json" >/dev/null 2>&1 \
+      || error "Block producers require LedgerDB.Backend=V2InMemory; rerun with --refresh-config --ledger-backend V2InMemory --fresh-db"
+  fi
   CONFIG_P2P=$(jq -r '.EnableP2P // false' "${FILES_DIR}/config.json")
   [[ "${CONFIG_P2P}" == "${TOPOLOGY_P2P}" ]] \
     || error "Preserved config EnableP2P=${CONFIG_P2P} does not match protected topology P2P=${TOPOLOGY_P2P}; use --refresh-config"
@@ -612,14 +616,13 @@ except Exception:
   fi
   if ${ASSUME_YES} || ${DRY_RUN}; then
     LEDGER_BACKEND="${CURRENT_BACKEND}"
+  elif [[ "${NODE_ROLE}" == "bp" ]]; then
+    LEDGER_BACKEND="V2InMemory"
   else
     echo ""
     echo -e "${GREEN}LedgerDB backend options:${NC}"
     echo "  1) V2InMemory - ledger state in RAM (faster forging, higher memory ~16-24 GB)"
     echo "  2) V2LSM      - ledger state on disk (lower memory ~4-8 GB, slightly higher latency)"
-    if [[ "${NODE_ROLE}" == "bp" ]]; then
-      echo -e "${YELLOW}[WARN]${NC}  V2InMemory is recommended for block producers to minimize forge latency."
-    fi
     read -r -p "Choose backend [1=V2InMemory (default), 2=V2LSM]: " backend_choice
     case "${backend_choice}" in
       2)  LEDGER_BACKEND="V2LSM" ;;
@@ -627,6 +630,10 @@ except Exception:
     esac
   fi
   info "LedgerDB backend: ${LEDGER_BACKEND}"
+fi
+
+if ! ${KEEP_CONFIG} && [[ "${NODE_ROLE}" == "bp" && "${LEDGER_BACKEND}" != "V2InMemory" ]]; then
+  error "Block producers require --ledger-backend V2InMemory; V2LSM is only supported for relays"
 fi
 
 # --- Smart DB decision (unless --fresh-db already set) -----------------------
