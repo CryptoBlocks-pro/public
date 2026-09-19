@@ -19,11 +19,15 @@ set -euo pipefail
 #   ./upgrade-cardano-node.sh --relay                  # auto-detect latest
 #   ./upgrade-cardano-node.sh --network preview --bp
 #   ./upgrade-cardano-node.sh --network preprod --version 11.1.2 --bp
+#   ./upgrade-cardano-node.sh --network mainnet --node-home /opt/cardano/lgc --version 11.1.2 --bp --dry-run
 #   ./upgrade-cardano-node.sh --version 12.0.0 --relay --fresh-db
 #   ./upgrade-cardano-node.sh --relay --url https://... --version 10.7.1
 #
 # Flags:
 #   --network      Network profile: mainnet, preprod, or preview (default: mainnet)
+#   --node-home    Custom Guild instance home; network still controls chain semantics
+#   --service      Custom instance service override (default: <node-home basename>.service)
+#   --binary-dir   Explicit custom target directory when version-path inference is ambiguous
 #   --version      Target version (default: latest GitHub release)
 #   --url          Custom binary download URL (overrides auto-detected URL)
 #   --relay        Explicit relay role (one of --relay/--bp is required)
@@ -308,19 +312,59 @@ set_env_value() {
   key="$2"
   value="$3"
   python3 - "${env_file}" "${key}" "${value}" <<'PYEOF'
-import pathlib, re, sys
+import os, pathlib, re, stat, sys, tempfile
 
 path = pathlib.Path(sys.argv[1])
 key = sys.argv[2]
 value = sys.argv[3]
 text = path.read_text()
 replacement = f'{key}="{value}"'
-pattern = re.compile(rf'^#?{re.escape(key)}=.*$', re.MULTILINE)
-if pattern.search(text):
-    text = pattern.sub(replacement, text, count=1)
+pattern = re.compile(
+  rf'^{re.escape(key)}\s*='
+  rf'(?P<value>"[^"]*"|\'[^\']*\'|[^#\s]+)(?P<comment>\s+#.*)?$',
+  re.MULTILINE,
+)
+matches = list(pattern.finditer(text))
+if len(matches) > 1:
+  raise SystemExit(f'Duplicate active {key} assignments in {path}')
+if matches:
+  text = pattern.sub(lambda match: replacement + (match.group('comment') or ''), text, count=1)
 else:
-    text = replacement + '\n' + text
-path.write_text(text)
+  text = replacement + '\n' + text
+metadata = path.stat()
+descriptor, temporary_name = tempfile.mkstemp(prefix=f'.{path.name}.upgrade-', dir=path.parent)
+temporary = pathlib.Path(temporary_name)
+try:
+  with os.fdopen(descriptor, 'w') as output:
+    output.write(text)
+    output.flush()
+    os.fsync(output.fileno())
+  os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+  os.chown(temporary, metadata.st_uid, metadata.st_gid)
+  os.replace(temporary, path)
+  directory = os.open(path.parent, os.O_RDONLY)
+  try:
+    os.fsync(directory)
+  finally:
+    os.close(directory)
+finally:
+  temporary.unlink(missing_ok=True)
+PYEOF
+}
+
+remove_legacy_tracer_keys() {
+  python3 - "$1" <<'PYEOF'
+import json, pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+changed = False
+for key in ('TurnOnLogging', 'TurnOnLogMetrics', 'UseTraceDispatcher'):
+  if key in config:
+    del config[key]
+    changed = True
+if changed:
+  path.write_text(json.dumps(config, indent=2) + '\n')
 PYEOF
 }
 
@@ -379,6 +423,8 @@ rollback_on_exit() {
         install -m 0755 "${BINARY_BACKUP_DIR}/${binary_name}" "${ACTIVE_BIN_DIR}/.${binary_name}.rollback" \
           && mv -f "${ACTIVE_BIN_DIR}/.${binary_name}.rollback" "${ACTIVE_BIN_DIR}/${binary_name}" \
           || rollback_failed=true
+      elif ${CUSTOM_INSTANCE}; then
+        warn "Retaining new custom binary after rollback for inspection: ${ACTIVE_BIN_DIR}/${binary_name}"
       else
         rm -f "${ACTIVE_BIN_DIR}/${binary_name}" || rollback_failed=true
       fi
@@ -400,6 +446,10 @@ rollback_on_exit() {
   fi
   [[ "$(sha256sum "${FILES_DIR}/config.json" | awk '{print $1}')" == "${CONFIG_HASH_BEFORE}" ]] || rollback_failed=true
   [[ "$(sha256sum "${ENV_FILE}" | awk '{print $1}')" == "${ENV_HASH_BEFORE}" ]] || rollback_failed=true
+  [[ "$(sha256sum "${CURRENT_NODE_BIN}" 2>/dev/null | awk '{print $1}')" == "${CURRENT_NODE_HASH_BEFORE}" ]] \
+    || rollback_failed=true
+  [[ "$(sha256sum "${CURRENT_CLI_BIN}" 2>/dev/null | awk '{print $1}')" == "${CURRENT_CLI_HASH_BEFORE}" ]] \
+    || rollback_failed=true
   if ! ${rollback_failed} && [[ "${NODE_WAS_ACTIVE}" == "true" ]]; then
     sudo systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
     sudo systemctl start "${SERVICE_NAME}" || rollback_failed=true
@@ -417,6 +467,10 @@ rollback_on_exit() {
 # --- Parse arguments ---------------------------------------------------------
 NODE_ROLE=""
 TOPOLOGY_BACKUP=""
+NODE_HOME_OVERRIDE=""
+SERVICE_OVERRIDE=""
+BINARY_DIR_OVERRIDE=""
+CUSTOM_INSTANCE=false
 DRY_RUN=false
 TARGET_VERSION=""
 CUSTOM_URL=""
@@ -431,6 +485,15 @@ while [[ $# -gt 0 ]]; do
     --network)
       [[ $# -ge 2 ]] || error "--network requires mainnet, preprod, or preview"
       NETWORK="$2"; shift 2 ;;
+    --node-home)
+      [[ $# -ge 2 ]] || error "--node-home requires an absolute path"
+      NODE_HOME_OVERRIDE="$2"; shift 2 ;;
+    --service)
+      [[ $# -ge 2 ]] || error "--service requires a systemd service unit"
+      SERVICE_OVERRIDE="$2"; shift 2 ;;
+    --binary-dir)
+      [[ $# -ge 2 ]] || error "--binary-dir requires an absolute path"
+      BINARY_DIR_OVERRIDE="$2"; shift 2 ;;
     --version)
       [[ $# -ge 2 ]] || error "--version requires a value (e.g. --version 11.0.1)"
       TARGET_VERSION="$2"; shift 2 ;;
@@ -451,11 +514,15 @@ while [[ $# -gt 0 ]]; do
       LEDGER_BACKEND="$2"; LEDGER_BACKEND_EXPLICIT=true; shift 2 ;;
     --yes)         ASSUME_YES=true; shift ;;
     --dry-run)     DRY_RUN=true; shift ;;
-    *)             error "Unknown argument: $1\nUsage: $0 [--network mainnet|preprod|preview] [--version X.Y.Z] [--url URL] [--relay|--bp] [--keep-config|--refresh-config] [--fresh-db] [--ledger-backend V2InMemory|V2LSM] [--yes] [--dry-run]" ;;
+    *)             error "Unknown argument: $1\nUsage: $0 [--network mainnet|preprod|preview] [--node-home PATH [--service UNIT] [--binary-dir PATH]] [--version X.Y.Z] [--url URL] [--relay|--bp] [--keep-config|--refresh-config] [--fresh-db] [--ledger-backend V2InMemory|V2LSM] [--yes] [--dry-run]" ;;
   esac
 done
 
 [[ -n "${NODE_ROLE}" ]] || error "Specify --relay or --bp explicitly; role is never guessed"
+[[ -z "${SERVICE_OVERRIDE}" || -n "${NODE_HOME_OVERRIDE}" ]] \
+  || error "--service is only valid with --node-home"
+[[ -z "${BINARY_DIR_OVERRIDE}" || -n "${NODE_HOME_OVERRIDE}" ]] \
+  || error "--binary-dir is only valid with --node-home"
 [[ "${EUID}" -ne 0 ]] || error "Run as the Cardano service user, not root"
 [[ -f "${CONFIG_PLANNER}" ]] || error "Missing planner: clone/update the entire repository, not only this script"
 for prerequisite in python3 jq curl systemctl journalctl sha256sum flock timeout; do
@@ -492,11 +559,30 @@ case "${NETWORK}" in
     ;;
 esac
 
+if [[ -n "${NODE_HOME_OVERRIDE}" ]]; then
+  CUSTOM_INSTANCE=true
+  [[ "${NODE_HOME_OVERRIDE}" == /* ]] || error "--node-home must be an absolute path"
+  [[ -d "${NODE_HOME_OVERRIDE}" && ! -L "${NODE_HOME_OVERRIDE}" ]] \
+    || error "--node-home must be an existing non-symlink directory"
+  CNODE_HOME=$(readlink -f -- "${NODE_HOME_OVERRIDE}")
+  INSTANCE_NAME=$(basename -- "${CNODE_HOME}")
+  [[ "${INSTANCE_NAME}" =~ ^[A-Za-z0-9_.@-]+$ ]] \
+    || error "Cannot derive a safe service name from --node-home: ${INSTANCE_NAME}"
+  SERVICE_NAME="${SERVICE_OVERRIDE:-${INSTANCE_NAME}.service}"
+  [[ "${SERVICE_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*\.service$ ]] \
+    || error "Invalid service unit: ${SERVICE_NAME}"
+fi
+BACKUP_SCOPE="${NETWORK}"
+${CUSTOM_INSTANCE} && BACKUP_SCOPE="${NETWORK}-${INSTANCE_NAME}"
+
 FILES_DIR="${CNODE_HOME}/files"
 DB_DIR="${CNODE_HOME}/db"
 ENV_FILE="${CNODE_HOME}/scripts/env"
 TOPOLOGY_FILE="${FILES_DIR}/topology.json"
 CONFIG_BASE_URL="https://book.world.dev.cardano.org/environments/${NETWORK}"
+[[ -d "${FILES_DIR}" && -f "${ENV_FILE}" && -f "${FILES_DIR}/config.json" \
+  && -f "${TOPOLOGY_FILE}" && -d "${DB_DIR}" ]] \
+  || error "Selected node home is missing files, scripts/env, config, topology, or database: ${CNODE_HOME}"
 
 # Lock the node-home inode without creating or modifying a live file (also in dry-run).
 exec {UPGRADE_LOCK_FD}<"${CNODE_HOME}"
@@ -506,11 +592,18 @@ SERVICE_USER=$(systemctl show -p User --value "${SERVICE_NAME}")
   || error "Run as service user ${SERVICE_USER:-root}; current user is $(id -un)"
 systemctl is-active --quiet "${SERVICE_NAME}" || error "Service must be active for path/role verification"
 INITIAL_PID=$(systemctl show -p MainPID --value "${SERVICE_NAME}")
-python3 - "${INITIAL_PID}" "${FILES_DIR}" "${NODE_ROLE}" <<'PYEOF'
+verify_service_process() {
+  local pid="$1" expected_executable="${2:-}"
+  python3 - "${pid}" "${FILES_DIR}" "${DB_DIR}" "${NODE_ROLE}" \
+    "${expected_executable}" "${PROC_ROOT:-}" <<'PYEOF'
 import os, pathlib, sys
-pid, directory, role = sys.argv[1:]
-proc = pathlib.Path('/proc') / pid
-assert proc.stat().st_uid == os.getuid(), 'Service process belongs to a different user'
+pid, directory, database, role, expected_executable, proc_override = sys.argv[1:]
+if not pid.isdigit() or int(pid) <= 0:
+  raise SystemExit(f'Invalid service process ID: {pid}')
+proc_root = pathlib.Path('/proc') if not proc_override else pathlib.Path(proc_override)
+proc = proc_root / pid
+if proc.stat().st_uid != os.getuid():
+  raise SystemExit('Service process belongs to a different user')
 args = (proc / 'cmdline').read_bytes().decode().split('\0')
 def argument(name):
   for i, value in enumerate(args):
@@ -523,11 +616,29 @@ for flag, name in (('--config', 'config.json'), ('--topology', 'topology.json'))
   active = pathlib.Path(argument(flag))
   if not active.is_absolute():
     active = (proc / 'cwd').resolve() / active
-  assert active.resolve() == (pathlib.Path(directory) / name).resolve(), f'Unexpected active {flag}: {active}'
+  if active.resolve() != (pathlib.Path(directory) / name).resolve():
+    raise SystemExit(f'Unexpected active {flag}: {active}')
+active_database = pathlib.Path(argument('--database-path'))
+if not active_database.is_absolute():
+  active_database = (proc / 'cwd').resolve() / active_database
+if active_database.resolve() != pathlib.Path(database).resolve():
+  raise SystemExit(f'Unexpected active --database-path: {active_database}')
 forging = any(a.split('=', 1)[0] in ('--shelley-kes-key', '--shelley-vrf-key',
         '--shelley-operational-certificate', '--byron-signing-key', '--byron-delegation-certificate') for a in args)
-assert forging == (role == 'bp'), 'Declared role contradicts active forging arguments; inspect service invocation'
+if forging != (role == 'bp'):
+  raise SystemExit('Declared role contradicts active forging arguments; inspect service invocation')
+if expected_executable:
+  expected = pathlib.Path(expected_executable)
+  if not expected.is_absolute():
+    raise SystemExit(f'Expected executable is not absolute: {expected}')
+  if any(path.is_symlink() for path in (expected, *expected.parents)):
+    raise SystemExit(f'Expected executable path contains a symlink: {expected}')
+  actual = (proc / 'exe').resolve(strict=True)
+  if actual != expected.resolve(strict=True):
+    raise SystemExit(f'Unexpected active executable: {actual}')
 PYEOF
+}
+verify_service_process "${INITIAL_PID}"
 CONFIG_HASH_BEFORE=$(sha256sum "${FILES_DIR}/config.json" | awk '{print $1}')
 ENV_HASH_BEFORE=$(sha256sum "${ENV_FILE}" | awk '{print $1}')
 TOPOLOGY_HASH_BEFORE=$(sha256sum "${TOPOLOGY_FILE}" | awk '{print $1}')
@@ -535,6 +646,246 @@ TOPOLOGY_HASH_BEFORE=$(sha256sum "${TOPOLOGY_FILE}" | awk '{print $1}')
 read_env_value() {
   local key="$1"
   sed -n "s|^${key}=[\"']\{0,1\}\([^\"' #]*\).*$|\1|p" "${ENV_FILE}" | head -1
+}
+
+read_env_path() {
+  local key="$1"
+  python3 - "${ENV_FILE}" "${key}" "${HOME}" <<'PYEOF'
+import pathlib, re, shlex, sys
+
+env_file, key, home = sys.argv[1:]
+assignments = []
+pattern = re.compile(r'^' + re.escape(key) + r'\s*=\s*(.*?)\s*$')
+for line in pathlib.Path(env_file).read_text().splitlines():
+  if not line.strip() or line.lstrip().startswith('#'):
+    continue
+  match = pattern.match(line)
+  if match:
+    assignments.append(match.group(1))
+if len(assignments) > 1:
+  raise SystemExit(f'Duplicate active {key} assignments in {env_file}')
+if not assignments:
+  raise SystemExit(0)
+
+raw = assignments[0]
+expand_home = not raw.lstrip().startswith("'")
+lexer = shlex.shlex(raw, posix=True)
+lexer.whitespace_split = True
+lexer.commenters = '#'
+try:
+  values = list(lexer)
+except ValueError as exc:
+  raise SystemExit(f'Invalid quoting in {key} assignment: {exc}') from exc
+if len(values) != 1:
+  raise SystemExit(f'{key} must contain exactly one path value')
+raw = values[0]
+if not raw or any(token in raw for token in ('`', '$(', ';', '|', '&', '<', '>')):
+  raise SystemExit(f'Unsupported shell syntax in {key} assignment')
+if expand_home:
+  if raw == '$HOME' or raw == '${HOME}':
+    raw = home
+  elif raw.startswith('$HOME/'):
+    raw = home + raw[5:]
+  elif raw.startswith('${HOME}/'):
+    raw = home + raw[7:]
+path = pathlib.Path(raw)
+if not path.is_absolute():
+  raise SystemExit(f'{key} must resolve to an absolute path')
+print(path)
+PYEOF
+}
+
+infer_custom_binary_dir() {
+  local current_binary="$1" current_version="$2" target_version="$3" explicit_dir="$4"
+  python3 - "${current_binary}" "${current_version}" "${target_version}" \
+  "${explicit_dir}" "${HOME}/.local/bin" "${CNODE_HOME}" "${DB_DIR}" <<'PYEOF'
+import os, pathlib, sys
+
+current, old, new, explicit, shared, node_home, database = sys.argv[1:]
+if explicit:
+  target = pathlib.Path(explicit)
+  if not target.is_absolute():
+    raise SystemExit('--binary-dir must be an absolute path')
+else:
+  current_path = pathlib.Path(current)
+  matches = [index for index, part in enumerate(current_path.parts) if part.count(old) == 1]
+  if len(matches) != 1:
+    raise SystemExit('Cannot infer one target binary directory from the current version; use --binary-dir')
+  parts = list(current_path.parts)
+  index = matches[0]
+  parts[index] = parts[index].replace(old, new, 1)
+  target = pathlib.Path(*parts).parent
+
+target = pathlib.Path(os.path.abspath(target))
+shared = pathlib.Path(os.path.abspath(shared))
+node_home = pathlib.Path(os.path.abspath(node_home))
+database = pathlib.Path(os.path.abspath(database))
+if target == shared:
+  raise SystemExit(f'Custom instances may not target shared binary directory {shared}')
+if target == node_home or node_home in target.parents or target == database or database in target.parents:
+  raise SystemExit('Custom binary directory may not be inside the node home or database')
+for candidate in (target, *target.parents):
+  if candidate.is_symlink():
+    raise SystemExit(f'Refusing symlinked binary path component: {candidate}')
+print(target)
+PYEOF
+}
+
+validate_custom_binary_target() {
+  local target="$1" selected_pid="$2" proc_root="${3:-${PROC_ROOT:-/proc}}"
+  python3 - "${target}" "${selected_pid}" "${proc_root}" <<'PYEOF'
+import os, pathlib, sys
+
+target, selected_pid, proc_root = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+ancestor = target
+while not ancestor.exists():
+  if ancestor.is_symlink():
+    raise SystemExit(f'Refusing symlinked binary path component: {ancestor}')
+  if ancestor == ancestor.parent:
+    raise SystemExit(f'No existing ancestor for binary directory: {target}')
+  ancestor = ancestor.parent
+if ancestor.is_symlink() or not ancestor.is_dir():
+  raise SystemExit(f'Binary path ancestor is not a real directory: {ancestor}')
+stat = ancestor.stat()
+if stat.st_uid != os.getuid() or not os.access(ancestor, os.W_OK | os.X_OK):
+  raise SystemExit(f'Binary path ancestor is not owned and writable by the service user: {ancestor}')
+if target.exists() and (target.is_symlink() or not target.is_dir() or target.stat().st_uid != os.getuid()):
+  raise SystemExit(f'Existing binary target is not a service-user-owned real directory: {target}')
+
+for proc in proc_root.iterdir():
+  if not proc.name.isdigit() or proc.name == selected_pid:
+    continue
+  try:
+    executable = (proc / 'exe').resolve(strict=True)
+  except (FileNotFoundError, PermissionError, OSError):
+    continue
+  if executable == target / 'cardano-node' or executable.parent == target:
+    raise SystemExit(f'Unrelated live process {proc.name} uses custom binary target: {executable}')
+PYEOF
+}
+
+classify_custom_binary_target() {
+  local target="$1" staged="$2"
+  python3 - "${target}" "${staged}" <<'PYEOF'
+import hashlib, pathlib, sys
+
+target, staged = map(pathlib.Path, sys.argv[1:])
+if not target.exists() or not any(target.iterdir()):
+  print('new')
+  raise SystemExit(0)
+if target.is_symlink() or not target.is_dir():
+  raise SystemExit(f'Conflicting custom binary target: {target}')
+
+staged_files = {path.name: path for path in staged.iterdir() if path.is_file()}
+target_entries = {path.name: path for path in target.iterdir()}
+if set(target_entries) != set(staged_files) or any(not path.is_file() or path.is_symlink()
+                           for path in target_entries.values()):
+  raise SystemExit(f'Existing custom binary target does not exactly match the staged package: {target}')
+digest = lambda path: hashlib.sha256(path.read_bytes()).digest()
+if any(digest(source) != digest(target_entries[name]) for name, source in staged_files.items()):
+  raise SystemExit(f'Existing custom binary target conflicts with the staged package: {target}')
+print('reuse')
+PYEOF
+}
+
+snapshot_custom_binary_target() {
+  local target="$1"
+  python3 - "${target}" <<'PYEOF'
+import hashlib, json, pathlib, stat, sys
+
+target = pathlib.Path(sys.argv[1])
+if not target.exists():
+    print('absent')
+    raise SystemExit(0)
+entries = []
+for path in sorted(target.rglob('*')):
+    metadata = path.lstat()
+    kind = 'symlink' if path.is_symlink() else 'file' if path.is_file() else 'directory'
+    digest = hashlib.sha256(path.read_bytes()).hexdigest() if kind == 'file' else None
+    entries.append((str(path.relative_to(target)), kind, stat.S_IMODE(metadata.st_mode),
+                    metadata.st_uid, metadata.st_gid, metadata.st_size, digest))
+print(hashlib.sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest())
+PYEOF
+}
+
+install_custom_binaries() {
+  local target="$1" staged="$2"
+  python3 - "${target}" "${staged}" <<'PYEOF'
+import hashlib, os, pathlib, stat, sys
+
+target, staged = map(pathlib.Path, sys.argv[1:])
+if not target.is_absolute():
+  raise SystemExit('Custom binary target must be absolute')
+open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+directory_fd = os.open('/', open_flags)
+created = False
+try:
+  for component in target.parts[1:]:
+    try:
+      next_fd = os.open(component, open_flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+      parent = os.fstat(directory_fd)
+      if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o300 != 0o300:
+        raise SystemExit(f'Cannot securely create custom binary directory below {component!r}')
+      os.mkdir(component, mode=0o755, dir_fd=directory_fd)
+      created = True
+      next_fd = os.open(component, open_flags, dir_fd=directory_fd)
+    os.close(directory_fd)
+    directory_fd = next_fd
+
+  target_stat = os.fstat(directory_fd)
+  if target_stat.st_uid != os.getuid():
+    raise SystemExit(f'Custom binary target is not owned by the service user: {target}')
+  if os.listdir(directory_fd):
+    raise SystemExit(f'Custom binary target changed or is not empty: {target}')
+
+  staged_files = sorted(path for path in staged.iterdir() if path.is_file())
+  if not staged_files:
+    raise SystemExit('No staged binaries to install')
+  for source in staged_files:
+    source_stat = source.lstat()
+    if source.is_symlink() or not stat.S_ISREG(source_stat.st_mode):
+      raise SystemExit(f'Refusing non-regular staged binary: {source}')
+    temporary = f'.{source.name}.upgrade-{os.getpid()}'
+    source_digest = hashlib.sha256()
+    output_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o755, dir_fd=directory_fd)
+    try:
+      with source.open('rb') as input_file, os.fdopen(output_fd, 'wb', closefd=False) as output_file:
+        while chunk := input_file.read(1024 * 1024):
+          source_digest.update(chunk)
+          output_file.write(chunk)
+        output_file.flush()
+        os.fsync(output_fd)
+      os.fchmod(output_fd, 0o755)
+    finally:
+      os.close(output_fd)
+    os.rename(temporary, source.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    installed_fd = os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+      installed_stat = os.fstat(installed_fd)
+      if not stat.S_ISREG(installed_stat.st_mode):
+        raise SystemExit(f'Installed custom binary is not a regular file: {source.name}')
+      installed_digest = hashlib.sha256()
+      while chunk := os.read(installed_fd, 1024 * 1024):
+        installed_digest.update(chunk)
+      if installed_digest.digest() != source_digest.digest():
+        raise SystemExit(f'Installed custom binary differs from staged content: {source.name}')
+    finally:
+      os.close(installed_fd)
+  os.fsync(directory_fd)
+
+  visible = target.lstat()
+  if stat.S_ISLNK(visible.st_mode) or (visible.st_dev, visible.st_ino) != (target_stat.st_dev, target_stat.st_ino):
+    raise SystemExit(f'Custom binary target path changed during installation: {target}')
+except Exception:
+  if created:
+    # Keep any securely written directory for inspection; never follow or remove a replacement path.
+    pass
+  raise
+finally:
+  os.close(directory_fd)
+PYEOF
 }
 
 CONFIG_PROM_LINE=$(jq -r '.TraceOptions."".backends[]? | select(startswith("PrometheusSimple"))' "${FILES_DIR}/config.json" 2>/dev/null | head -1)
@@ -637,8 +988,9 @@ if ${KEEP_CONFIG} && version_at_least "${TARGET_VERSION}" "11.1.2"; then
     | map(select(. as $key | $config | has($key)))
     | join(", ")
   ' "${FILES_DIR}/config.json")
-  [[ -z "${LEGACY_TRACER_KEYS}" ]] \
-    || error "Preserved config contains unsupported legacy tracer keys (${LEGACY_TRACER_KEYS}); rerun with --refresh-config"
+  if [[ -n "${LEGACY_TRACER_KEYS}" ]]; then
+    info "Unsupported legacy tracer keys will be removed from the staged config: ${LEGACY_TRACER_KEYS}"
+  fi
   jq -e '.LedgerDB.Backend == "V2InMemory" or .LedgerDB.Backend == "V2LSM"' "${FILES_DIR}/config.json" >/dev/null 2>&1 \
     || error "Preserved config must explicitly select LedgerDB.Backend; rerun with --refresh-config and --ledger-backend"
   if [[ "${NODE_ROLE}" == "bp" ]]; then
@@ -648,13 +1000,8 @@ if ${KEEP_CONFIG} && version_at_least "${TARGET_VERSION}" "11.1.2"; then
   info "--keep-config preserves custom settings except explicit Praos/P2P/BP privacy normalization"
 fi
 
-if [[ "${NETWORK}" == "mainnet" ]]; then
-  ACTIVE_BIN_DIR="${BIN_DIR}"
-else
-  ACTIVE_BIN_DIR="${HOME}/.local/cardano-node/${TARGET_VERSION}/bin"
-fi
 STAGED_BIN_DIR="${WORK_DIR}/binaries"
-info "Install path:   ${ACTIVE_BIN_DIR}"
+BINARY_DESTINATION_SOURCE="standard"
 
 # --- Resolve download URL and architecture -----------------------------------
 ARCH=$(uname -m)
@@ -678,16 +1025,65 @@ else
   info "Download URL:   ${NODE_RELEASE_URL}"
 fi
 
-CURRENT_NODE_BIN="${ACTIVE_BIN_DIR}/cardano-node"
-CURRENT_CLI_BIN="${ACTIVE_BIN_DIR}/cardano-cli"
-if [[ "${NETWORK}" != "mainnet" && -f "${ENV_FILE}" ]]; then
-  ENV_NODE_BIN=$(sed -n 's|^CNODEBIN="\{0,1\}\([^" ]*\)"\{0,1\}$|\1|p' "${ENV_FILE}" | head -1)
-  [[ -x "${ENV_NODE_BIN:-}" ]] && CURRENT_NODE_BIN="${ENV_NODE_BIN}"
+if ${CUSTOM_INSTANCE}; then
+  ENV_NODE_BIN=""
+  if ! ENV_NODE_BIN=$(read_env_path CNODEBIN 2>&1); then
+    error "${ENV_NODE_BIN}"
+  fi
+  PROCESS_NODE_BIN=$(readlink -f "/proc/${INITIAL_PID}/exe") \
+    || error "Cannot resolve active service executable"
+  if [[ -n "${ENV_NODE_BIN}" ]]; then
+    [[ -x "${ENV_NODE_BIN}" && ! -L "${ENV_NODE_BIN}" ]] \
+      || error "Configured CNODEBIN is not a regular non-symlink executable: ${ENV_NODE_BIN}"
+    [[ "$(readlink -f "${ENV_NODE_BIN}")" == "${PROCESS_NODE_BIN}" ]] \
+      || error "Configured CNODEBIN does not match active service executable: ${ENV_NODE_BIN}"
+    CURRENT_NODE_BIN="${ENV_NODE_BIN}"
+  else
+    [[ -n "${BINARY_DIR_OVERRIDE}" ]] \
+      || error "CNODEBIN is not explicitly configured; use --binary-dir after reviewing the active executable"
+    CURRENT_NODE_BIN="${PROCESS_NODE_BIN}"
+  fi
+  ENV_CLI_BIN=""
+  if ! ENV_CLI_BIN=$(read_env_path CCLI 2>&1); then
+    error "${ENV_CLI_BIN}"
+  fi
+  CURRENT_CLI_BIN="${ENV_CLI_BIN:-$(dirname "${CURRENT_NODE_BIN}")/cardano-cli}"
+  [[ -x "${CURRENT_CLI_BIN}" && ! -L "${CURRENT_CLI_BIN}" ]] \
+    || error "Configured cardano-cli is not a regular non-symlink executable: ${CURRENT_CLI_BIN}"
+  CURRENT_VERSION=$("${CURRENT_NODE_BIN}" --version 2>/dev/null | head -1 | awk '{print $2}') \
+    || CURRENT_VERSION="unknown"
+  [[ "${CURRENT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || error "Could not determine current semantic version from ${CURRENT_NODE_BIN}"
+  if ! ACTIVE_BIN_DIR=$(infer_custom_binary_dir "${CURRENT_NODE_BIN}" "${CURRENT_VERSION}" \
+      "${TARGET_VERSION}" "${BINARY_DIR_OVERRIDE}" 2>&1); then
+    error "${ACTIVE_BIN_DIR}"
+  fi
+  validate_custom_binary_target "${ACTIVE_BIN_DIR}" "${INITIAL_PID}" \
+    || error "Custom binary target validation failed"
+  BINARY_DESTINATION_SOURCE="$( [[ -n "${BINARY_DIR_OVERRIDE}" ]] && echo explicit || echo inferred )"
+  info "Active binary:  ${CURRENT_NODE_BIN}"
+  info "Install path:   ${ACTIVE_BIN_DIR} (${BINARY_DESTINATION_SOURCE})"
+else
+  if [[ "${NETWORK}" == "mainnet" ]]; then
+    ACTIVE_BIN_DIR="${BIN_DIR}"
+  else
+    ACTIVE_BIN_DIR="${HOME}/.local/cardano-node/${TARGET_VERSION}/bin"
+  fi
+  CURRENT_NODE_BIN="${ACTIVE_BIN_DIR}/cardano-node"
+  CURRENT_CLI_BIN="${ACTIVE_BIN_DIR}/cardano-cli"
+  if [[ "${NETWORK}" != "mainnet" && -f "${ENV_FILE}" ]]; then
+    ENV_NODE_BIN=$(sed -n 's|^CNODEBIN="\{0,1\}\([^" ]*\)"\{0,1\}$|\1|p' "${ENV_FILE}" | head -1)
+    [[ -x "${ENV_NODE_BIN:-}" ]] && CURRENT_NODE_BIN="${ENV_NODE_BIN}"
+  fi
+  CURRENT_CLI_BIN="$(dirname "${CURRENT_NODE_BIN}")/cardano-cli"
+  CURRENT_VERSION=$("${CURRENT_NODE_BIN}" --version 2>/dev/null | head -1 | awk '{print $2}') \
+    || CURRENT_VERSION="unknown"
+  info "Install path:   ${ACTIVE_BIN_DIR}"
 fi
-CURRENT_CLI_BIN="$(dirname "${CURRENT_NODE_BIN}")/cardano-cli"
-CURRENT_VERSION=$("${CURRENT_NODE_BIN}" --version 2>/dev/null | head -1 | awk '{print $2}') || CURRENT_VERSION="unknown"
 [[ "$(readlink -f "/proc/${INITIAL_PID}/exe")" == "$(readlink -f "${CURRENT_NODE_BIN}")" ]] \
   || error "Active process is not using the expected current binary ${CURRENT_NODE_BIN}"
+CURRENT_NODE_HASH_BEFORE=$(sha256sum "${CURRENT_NODE_BIN}" | awk '{print $1}')
+CURRENT_CLI_HASH_BEFORE=$(sha256sum "${CURRENT_CLI_BIN}" | awk '{print $1}')
 REUSE_INSTALLED_BINARIES=false
 if [[ -z "${CUSTOM_URL}" && "${CURRENT_VERSION}" == "${TARGET_VERSION}" && -x "${CURRENT_CLI_BIN}" \
   && "$(dirname "${CURRENT_NODE_BIN}")" == "${ACTIVE_BIN_DIR}" ]]; then
@@ -805,6 +1201,18 @@ STAGED_CLI_VERSION=$("${STAGED_BIN_DIR}/cardano-cli" --version | head -1 | awk '
 [[ -n "${STAGED_CLI_VERSION}" ]] || error "Staged cardano-cli did not report a version"
 info "Staged cardano-cli package version verified: ${STAGED_CLI_VERSION}"
 
+TARGET_BINARY_DISPOSITION="standard"
+if ${CUSTOM_INSTANCE}; then
+  if ! TARGET_BINARY_DISPOSITION=$(classify_custom_binary_target \
+      "${ACTIVE_BIN_DIR}" "${STAGED_BIN_DIR}" 2>&1); then
+    error "${TARGET_BINARY_DISPOSITION}"
+  fi
+  info "Binary target:  ${TARGET_BINARY_DISPOSITION} (${ACTIVE_BIN_DIR})"
+  TARGET_BINARY_STATE_BEFORE=$(snapshot_custom_binary_target "${ACTIVE_BIN_DIR}")
+else
+  TARGET_BINARY_STATE_BEFORE="standard"
+fi
+
 info "Current binary version: ${CURRENT_VERSION}"
 
 if [[ "${CURRENT_VERSION}" == "${TARGET_VERSION}" ]]; then
@@ -833,19 +1241,25 @@ fi
 info "Step 2: Backing up config files..."
 BACKUP_SUFFIX="${CURRENT_VERSION}-bak-$(date -u +%Y%m%dT%H%M%SZ)"
 [[ ! -e "${FILES_DIR}-${BACKUP_SUFFIX}" && ! -e "${ENV_FILE}-${BACKUP_SUFFIX}" \
-  && ! -e "${BACKUP_BIN_DIR}/${NETWORK}-${BACKUP_SUFFIX}" ]] || error "Backup path already exists; retry later"
+  && ! -e "${BACKUP_BIN_DIR}/${BACKUP_SCOPE}-${BACKUP_SUFFIX}" ]] || error "Backup path already exists; retry later"
 cp -a "${FILES_DIR}" "${FILES_DIR}-${BACKUP_SUFFIX}"
 cp -a "${ENV_FILE}" "${ENV_FILE}-${BACKUP_SUFFIX}"
 cp -a "${PLAN_DIR}/plan.json" "${FILES_DIR}-${BACKUP_SUFFIX}/upgrade-plan.json"
 python3 - "${FILES_DIR}-${BACKUP_SUFFIX}/upgrade-transaction.json" "${SERVICE_NAME}" \
   "${CURRENT_VERSION}" "${TARGET_VERSION}" "${ACTIVE_BIN_DIR}" \
-  "${BACKUP_BIN_DIR}/${NETWORK}-${BACKUP_SUFFIX}" "${ENV_FILE}" "${ENV_HASH_BEFORE}" \
-  "${DB_DIR}" "${FRESH_DB}" "${BACKUP_SUFFIX}" <<'PYEOF'
+  "${BACKUP_BIN_DIR}/${BACKUP_SCOPE}-${BACKUP_SUFFIX}" "${ENV_FILE}" "${ENV_HASH_BEFORE}" \
+  "${DB_DIR}" "${FRESH_DB}" "${BACKUP_SUFFIX}" "${CURRENT_NODE_BIN}" \
+  "${CURRENT_NODE_HASH_BEFORE}" "${CURRENT_CLI_BIN}" "${CURRENT_CLI_HASH_BEFORE}" \
+  "${BINARY_DESTINATION_SOURCE}" "${TARGET_BINARY_DISPOSITION}" <<'PYEOF'
 import json, pathlib, sys
-output, service, old, new, binaries, backup, env, env_hash, db, fresh, suffix = sys.argv[1:]
+output, service, old, new, binaries, backup, env, env_hash, db, fresh, suffix, current_binary, current_hash, current_cli, cli_hash, source, disposition = sys.argv[1:]
 pathlib.Path(output).write_text(json.dumps({
     'service': service, 'previous_version': old, 'target_version': new,
-    'binary_directory': binaries, 'binary_backup': backup,
+    'current_binary': current_binary, 'current_binary_sha256': current_hash,
+    'current_cli': current_cli, 'current_cli_sha256': cli_hash,
+    'binary_directory': binaries,
+    'binary_destination_source': source, 'binary_target_disposition': disposition,
+    'binary_backup': backup,
     'environment': env, 'environment_backup': env + '-' + suffix,
     'environment_before_sha256': env_hash, 'database': db,
     'fresh_database_requested': fresh == 'true',
@@ -858,7 +1272,7 @@ info "Guild environment backed up to ${ENV_FILE}-${BACKUP_SUFFIX} ✓"
 
 # --- Step 3: Backup current binaries -----------------------------------------
 info "Step 3: Backing up current binaries..."
-BINARY_BACKUP_DIR="${BACKUP_BIN_DIR}/${NETWORK}-${BACKUP_SUFFIX}"
+BINARY_BACKUP_DIR="${BACKUP_BIN_DIR}/${BACKUP_SCOPE}-${BACKUP_SUFFIX}"
 mkdir -p "${BINARY_BACKUP_DIR}"
 while IFS= read -r -d '' staged_file; do
   binary_name=$(basename "${staged_file}")
@@ -875,6 +1289,9 @@ mkdir -p "${CONFIG_STAGE_DIR}"
 if ${KEEP_CONFIG}; then
   info "Step 4: Keeping custom configuration; staging Praos normalization only"
   cp -a "${FILES_DIR}/config.json" "${CONFIG_STAGE_DIR}/config.json"
+  if version_at_least "${TARGET_VERSION}" "11.1.2"; then
+    remove_legacy_tracer_keys "${CONFIG_STAGE_DIR}/config.json"
+  fi
 else
   info "Step 4: Staging official ${NETWORK} configuration..."
   curl -fsSL "${CONFIG_BASE_URL}/config.json" -o "${CONFIG_STAGE_DIR}/config.json"
@@ -1054,7 +1471,7 @@ fi
 
 verify_plan_inputs() {
   python3 - "${WORK_DIR}/initial-plan/plan.json" "${PLAN_DIR}/plan.json" \
-    "${WORK_DIR}/network-dependencies.json" "${ENV_FILE}" "${ENV_HASH_BEFORE}" <<'PYEOF'
+    "${WORK_DIR}/network-dependencies.json" "${ENV_FILE}" "${ENV_HASH_BEFORE}" <<'PYEOF' || return 1
 import hashlib, json, pathlib, sys
 initial, final, network, env, env_hash = sys.argv[1:]
 digest = lambda p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
@@ -1069,6 +1486,15 @@ for path, expected in json.loads(pathlib.Path(network).read_text()).items():
     assert digest(path) == expected, f'Network dependency changed: {path}'
 assert digest(env) == env_hash, 'Guild env changed since planning'
 PYEOF
+  [[ "$(sha256sum "${CURRENT_NODE_BIN}" | awk '{print $1}')" == "${CURRENT_NODE_HASH_BEFORE}" ]] \
+    || { echo "Current cardano-node changed since planning" >&2; return 1; }
+  [[ "$(sha256sum "${CURRENT_CLI_BIN}" | awk '{print $1}')" == "${CURRENT_CLI_HASH_BEFORE}" ]] \
+    || { echo "Current cardano-cli changed since planning" >&2; return 1; }
+  if ${CUSTOM_INSTANCE}; then
+    validate_custom_binary_target "${ACTIVE_BIN_DIR}" "${INITIAL_PID}" || return 1
+    [[ "$(snapshot_custom_binary_target "${ACTIVE_BIN_DIR}")" == "${TARGET_BINARY_STATE_BEFORE}" ]] \
+      || { echo "Custom binary target changed since planning" >&2; return 1; }
+  fi
 }
 verify_plan_inputs || error "Inputs changed; refusing to overwrite concurrent changes"
 TOPOLOGY_HASH_EXPECTED=$(jq -r '.topology_after_sha256' "${PLAN_DIR}/plan.json")
@@ -1144,23 +1570,36 @@ info "Topology matches approved plan ✓"
 
 # --- Step 6: Copy new binaries -----------------------------------------------
 info "Step 6: Installing new binaries..."
-mkdir -p "${ACTIVE_BIN_DIR}"
-if ! ${REUSE_INSTALLED_BINARIES}; then
-BINARY_CHANGED=true
-while IFS= read -r -d '' staged_file; do
-  binary_name=$(basename "${staged_file}")
-  install -m 0755 "${staged_file}" "${ACTIVE_BIN_DIR}/.${binary_name}.new"
-  mv -f "${ACTIVE_BIN_DIR}/.${binary_name}.new" "${ACTIVE_BIN_DIR}/${binary_name}"
-done < <(find "${STAGED_BIN_DIR}" -maxdepth 1 -type f -print0)
+if ! ${REUSE_INSTALLED_BINARIES} \
+  && [[ "${TARGET_BINARY_DISPOSITION}" != "reuse" ]]; then
+  BINARY_CHANGED=true
+  if ${CUSTOM_INSTANCE}; then
+    install_custom_binaries "${ACTIVE_BIN_DIR}" "${STAGED_BIN_DIR}"
+  else
+    mkdir -p "${ACTIVE_BIN_DIR}"
+    while IFS= read -r -d '' staged_file; do
+      binary_name=$(basename "${staged_file}")
+      install -m 0755 "${staged_file}" "${ACTIVE_BIN_DIR}/.${binary_name}.new"
+      mv -f "${ACTIVE_BIN_DIR}/.${binary_name}.new" "${ACTIVE_BIN_DIR}/${binary_name}"
+    done < <(find "${STAGED_BIN_DIR}" -maxdepth 1 -type f -print0)
+  fi
 fi
 
-INSTALLED_VERSION=$("${ACTIVE_BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
+if ${CUSTOM_INSTANCE}; then
+  validate_custom_binary_target "${ACTIVE_BIN_DIR}" "${INITIAL_PID}" \
+    || error "Custom binary target changed after installation"
+  [[ "$(classify_custom_binary_target "${ACTIVE_BIN_DIR}" "${STAGED_BIN_DIR}")" == "reuse" ]] \
+    || error "Installed custom binaries do not match the staged package"
+  INSTALLED_VERSION="${STAGED_VERSION}"
+else
+  INSTALLED_VERSION=$("${ACTIVE_BIN_DIR}/cardano-node" --version | head -1 | awk '{print $2}')
+fi
 if [[ "${INSTALLED_VERSION}" != "${TARGET_VERSION}" ]]; then
   error "Installed version ${INSTALLED_VERSION} != expected ${TARGET_VERSION}"
 fi
 info "Binaries installed: cardano-node ${INSTALLED_VERSION} ✓"
 
-if [[ "${NETWORK}" != "mainnet" ]]; then
+if ${CUSTOM_INSTANCE} || [[ "${NETWORK}" != "mainnet" ]]; then
   ENV_CHANGED=true
   set_env_value "${ENV_FILE}" CNODEBIN "${ACTIVE_BIN_DIR}/cardano-node"
   if [[ -x "${ACTIVE_BIN_DIR}/cardano-cli" ]]; then
@@ -1248,6 +1687,8 @@ fi
 VALIDATION_INVOCATION=$(systemctl show -p InvocationID --value "${SERVICE_NAME}")
 [[ "${VALIDATION_INVOCATION}" =~ ^[[:xdigit:]]{32}$ ]] || error "Cannot determine new service invocation"
 VALIDATION_PID=$(systemctl show -p MainPID --value "${SERVICE_NAME}")
+verify_service_process "${VALIDATION_PID}" "${ACTIVE_BIN_DIR}/cardano-node" \
+  || error "Restarted service does not match the approved instance"
 
 # --- Step 9: Validate -------------------------------------------------------
 info "Step 9: Validating upgraded node startup..."
@@ -1279,7 +1720,6 @@ while (( SECONDS - VALIDATION_START_SECONDS < STARTUP_VALIDATION_TIMEOUT_SECONDS
   JOURNAL_TEXT=$(journalctl -q -u "${SERVICE_NAME}" "_SYSTEMD_INVOCATION_ID=${VALIDATION_INVOCATION}" \
     --since "${VALIDATION_STARTED_AT}" --no-hostname --no-pager) \
     || error "Journal probe failed; cannot claim no startup errors"
-  [[ -n "${JOURNAL_TEXT}" ]] || error "Journal evidence unavailable for new invocation; cannot validate startup safely"
   JOURNAL_FAILURES=$(grep -Ei '(\((Error|Critical|Alert|Emergency),|(^|[^[:alpha:]])(fatal|panic)([^[:alpha:]]|$)|uncaught exception)' \
     <<<"${JOURNAL_TEXT}" | grep -Ev 'Net\.PeerSelection\.Actions\.(ConnectionError|StatusChangeFailure)' || true)
   JOURNAL_PRIORITY_TEXT=$(journalctl -q -u "${SERVICE_NAME}" "_SYSTEMD_INVOCATION_ID=${VALIDATION_INVOCATION}" \
@@ -1294,7 +1734,7 @@ while (( SECONDS - VALIDATION_START_SECONDS < STARTUP_VALIDATION_TIMEOUT_SECONDS
     echo "${JOURNAL_FAILURES}" >&2
     error "Fatal/error journal entries detected after starting the upgraded node"
   fi
-  info "  ${ELAPSED}s journal errors: PASS (none detected)"
+  info "  ${ELAPSED}s journal errors: PASS (queries succeeded; none detected)"
 
   PROM_RESPONSE=$(curl -sf --max-time 5 "http://localhost:${PROM_PORT}/metrics" 2>/dev/null) || PROM_RESPONSE=""
   METRICS_VERSION=$(awk '/cardano_node_metrics_cardano_build_info/ && match($0, /version="[^"]+"/) { print substr($0, RSTART + 9, RLENGTH - 10); exit }' <<<"${PROM_RESPONSE}")
@@ -1366,6 +1806,8 @@ systemctl is-active --quiet "${SERVICE_NAME}" || error "Service stopped after ti
 [[ "$(sha256sum "${TOPOLOGY_FILE}" | awk '{print $1}')" == "${TOPOLOGY_HASH_EXPECTED}" && \
   "$(sha256sum "${FILES_DIR}/config.json" | awk '{print $1}')" == "$(jq -r '.config_after_sha256' "${PLAN_DIR}/plan.json")" ]] \
   || error "Installed config/topology changed during startup"
+verify_service_process "${VALIDATION_PID}" "${ACTIVE_BIN_DIR}/cardano-node" \
+  || error "Validated service no longer matches the approved instance"
 info "PraosMode configured at verified startup path; runtime consensus is not independently exposed by these probes"
 info "Startup accepted; full synchronization and peer-serving readiness are separate observations"
 ROLLBACK_ARMED=false

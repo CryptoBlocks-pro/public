@@ -7,9 +7,9 @@ nodes already running the requested binary version with a Genesis configuration.
 There is deliberately no Genesis-selection flag yet. P2P and consensus mode are
 independent: both legacy `Producers` and P2P topology can run Praos.
 
-Implementation has synthetic tests, not a production rollout. The topology policy
-is based on the Cardano 11.1.2 parser. Do not treat historical binary upgrades with
-this script as validation of the new planner on every older/newer release.
+The topology policy is based on the Cardano 11.1.2 parser. Synthetic coverage is
+supplemented by the production canary below, but neither historical upgrades nor one
+canary validate the planner for every older/newer release or installation layout.
 
 Use [upgrade-cardano-node.sh](upgrade-cardano-node.sh) together with its stdlib-only
 companion [upgrade-cardano-config.py](upgrade-cardano-config.py). Clone/update the
@@ -21,14 +21,29 @@ is resolved beside the script, independently of the working directory.
 - Run as the non-root systemd service user. `--relay` or `--bp` is mandatory;
   repeated/conflicting roles are rejected, never guessed from DNS or IP addresses.
 - The service must already be active. The script checks its user, process owner,
-  executable, configuration and topology paths, and forging arguments. Custom
+  executable, configuration, topology and database paths, and forging arguments. Custom
   wrappers, stopped nodes, or ambiguous process paths fail rather than modifying
   files that might not be in use. Forging keys are **not read**.
+- `--node-home` selects a custom Guild instance while `--network` continues to
+  select network magic, configuration sources and network validation. The service
+  defaults to `<node-home basename>.service`; use `--service` only when the unit
+  name differs. The selected unit must actively use that home.
+- For a custom instance, active `CNODEBIN` in `scripts/env` must agree with the
+  executable reported by `/proc`. By default the target directory is inferred by
+  replacing one unique current-version occurrence in that executable path. For
+  example, `~/tmp/cardano-11.0.1/bin/cardano-node` targets
+  `~/tmp/cardano-11.1.2/bin/cardano-node`. Ambiguous layouts require an absolute
+  `--binary-dir`.
+- A custom instance can never target the shared `~/.local/bin`. Symlinked, unsafe,
+  concurrently changed, conflicting or unrelated-live-process target directories
+  are refused rather than overwritten.
 - A node-home directory lock serializes cooperating upgrade runs. It does not
   prevent a separate editor, topology updater, or other administrator making changes.
 - `--keep-config` is the default. It preserves custom settings **except**
-  `ConsensusMode=PraosMode`, `EnableP2P` matched to the selected topology, and
-  `PeerSharing=false` for a BP. A semantically unchanged config retains its bytes.
+  `ConsensusMode=PraosMode`, `EnableP2P` matched to the selected topology,
+  `PeerSharing=false` for a BP, and removal of the unsupported top-level
+  `TurnOnLogging`, `TurnOnLogMetrics` and `UseTraceDispatcher` selectors for
+  cardano-node 11.1.2 or newer. A semantically unchanged config retains its bytes.
 - `--refresh-config` explicitly replaces the configuration with the current
   Operations Book configuration, normalizes Praos/P2P, retains the selected backend,
   metrics endpoint and relay `PeerSharing` choice, and applies relay traces.
@@ -52,17 +67,72 @@ For a mainnet relay targeting 11.1.2, pass `--network mainnet --version 11.1.2
 Review all diffs, topology source, discovery warnings and dependency validation.
 Only after approval, rerun without `--dry-run`; `--yes` suppresses ordinary prompts.
 
+For a custom mainnet BP at `/opt/cardano/lgc`, pass `--network mainnet
+--node-home /opt/cardano/lgc --version 11.1.2 --bp --keep-config --dry-run`.
+The script derives `lgc.service`, verifies its active invocation and prints the
+current executable, inferred or explicit target, and target disposition. Add
+`--service` or `--binary-dir` only when those defaults do not describe the reviewed
+installation.
+
 Dry-run uses actual scratch staging and validation, and may download release
 binaries and, with refresh, official configuration. It creates no live backups,
 installs no packages, and does not stop/start the service or change live node/DB
-files. Scratch is removed on normal exit and handled failures. A kill/power loss
+files. For a custom instance it also does not create the inferred target directory
+or edit `scripts/env`. Scratch is removed on normal exit and handled failures. A kill/power loss
 can leave scratch behind. Dry-run is not a promise the service can parse every
 field or start successfully; startup checks remain part of activation.
+
+Startup validation requires the same service invocation and executable, target-version
+Prometheus metrics, node activity, and successful general/priority journal queries with
+no detected errors. Ordinary journal text may be empty for units configured with
+`StandardOutput=null`; journal access failures and error entries remain fatal.
 
 Same-version runs reuse installed binaries and skip package changes when the
 installation directory also matches. They still restart: on-disk equality cannot
 prove that the running process loaded those bytes. Configuration-only planning is
 idempotent; a runtime-proven no-restart path remains future work.
+
+## Production canary and fleet rollout
+
+On 2026-09-18, the script upgraded the custom mainnet BP at `/opt/cardano/lgc` on
+Linux aarch64 from cardano-node 11.0.1 to 11.1.2. The canary preserved the database,
+topology bytes, V2InMemory backend and configured genesis identities; installed the
+new binaries in an isolated version directory; updated only that instance's Guild
+env; reached 100% tip sync with active peers; and left the shared Apex binary
+unchanged. Matching config, env and binary backups were retained.
+
+The first activation deliberately rolled back because `lgc.service` uses
+`StandardOutput=null`, leaving a successful invocation's ordinary journal empty.
+Validation now permits empty ordinary output while still requiring successful
+invocation-scoped general and priority queries, rejecting detected errors, and
+requiring exact process identity, target-version metrics and node activity. The
+rollback restored config, env and topology byte-for-byte before the successful retry.
+
+The moving Operations Book mainnet Conway genesis was semantically equal to LGC's
+file but had different bytes and therefore a different Cardano genesis hash. The
+refresh path correctly refused that identity change. The canary used `--keep-config`,
+preserved the existing genesis file/hash, and removed only the unsupported legacy
+tracer selectors in addition to the documented Praos/P2P/BP normalization. Never
+weaken the genesis identity guard to make a refresh pass.
+
+Roll out one VM at a time:
+
+1. Use an up-to-date checkout of the complete repository and run the Bash syntax,
+  unittest discovery and Git whitespace checks documented below.
+2. Inventory the active service, service user, role, network, node home, executable,
+  config/topology/database arguments, architecture, metrics endpoint and free space.
+  Determine whether it is a standard Guild layout or needs `--node-home`, `--service`
+  or `--binary-dir`; never infer role from the hostname.
+3. Run `--keep-config --dry-run` with an explicit version and role. Do not use
+  `--refresh-config`, `--fresh-db` or `--yes` to bypass a failed preflight. Review
+  every semantic diff, topology decision, target path, backend and genesis check.
+4. Obtain explicit approval for that VM's displayed plan. Rerun the identical command
+  without `--dry-run`, adding `--yes` only after approval. Do not batch activations.
+5. Independently verify the service PID/executable and forging role, target-version
+  metrics, advancing slot/tip, sync progress, peers, config/topology policy and
+  invocation-scoped error journal. Confirm unrelated/shared binaries are unchanged.
+6. Retain that run's matching config/env/binary backups until the VM has remained
+  operationally healthy. Stop the fleet rollout on any rollback or unexplained diff.
 
 ## Discovery and privacy
 
@@ -135,14 +205,17 @@ genesis directory. Current compatible topology otherwise wins over every backup.
    `upgrade-installed-files.txt` **before** per-file atomic replacement. Retain
    existing destination owner/group/mode. Config and recovered topology both join
    rollback, even under keep-config.
-5. Install changed binaries, apply any required testnet env paths, and perform only
-   explicitly requested database work. Start and validate the new invocation.
+5. Install changed binaries and atomically apply required Guild env paths, then
+  perform only explicitly requested database work. Start and validate the new invocation.
 
 Handled activation failure restores the original config/topology pair (including
 original Genesis settings), changed binaries, env and any renamed database. It checks
 original config/topology/env hashes before restarting the previous service. Failure
 to stop blocks restoration; failed restoration leaves the service stopped and reports
 manual recovery required. Backups and original peer snapshots are retained.
+For a custom instance, rollback restores the old env reference and deliberately
+retains a newly installed target-version directory for inspection; it does not
+delete the previous or new version directory.
 
 This is **not a power-loss-atomic multi-file transaction**. SIGKILL, power loss,
 uncooperative concurrent writers and hostile directory replacement cannot be made
@@ -169,7 +242,9 @@ safe by an EXIT trap. The persistent records help manual recovery:
 Validation accepts the correct active executable, target-version metrics and
 starting/replay/validation/slot activity. It does not wait hours for full sync or
 require peers during immutable DB replay. Logs are scoped to the new systemd
-invocation; unreadable/absent journal evidence is not reported as a clean journal.
+invocation; unreadable journal queries are not reported as clean. Empty ordinary
+output is allowed because some units use `StandardOutput=null`, but the priority
+query must succeed and any detected error remains fatal.
 Probe timestamps use real elapsed time, although individual commands and the final
 tip probe may add time beyond the configured loop budget.
 

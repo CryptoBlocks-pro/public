@@ -107,8 +107,8 @@ elif name in ('cardano-node', 'cardano-cli'):
 elif name in ('cp', 'mv', 'rm', 'cmp', 'mkdir', 'sha256sum', 'basename', 'dirname', 'readlink'):
     allowed = {'cp': {'-a', '--'}, 'mv': {'-f', '--'},
                'rm': {'-f', '-rf', '--'}, 'cmp': {'-s'},
-               'mkdir': {'-p'}, 'sha256sum': set(), 'basename': set(),
-               'dirname': {'--'}, 'readlink': {'-f'}}[name]
+               'mkdir': {'-p'}, 'sha256sum': set(), 'basename': {'--'},
+               'dirname': {'--'}, 'readlink': {'-f', '--'}}[name]
     for value in args:
         if value.startswith('-'):
             if value not in allowed:
@@ -206,6 +206,8 @@ elif name == 'jq':
         value = isinstance(data.get('TraceOptions', {}).get('', {}).get('backends'), list)
     elif query == '.LedgerDB.Backend == "V2InMemory" or .LedgerDB.Backend == "V2LSM"' and args[0] == '-e':
         value = data.get('LedgerDB', {}).get('Backend') in ('V2InMemory', 'V2LSM')
+    elif query == '.LedgerDB.Backend == "V2InMemory"' and args[0] == '-e':
+        value = data.get('LedgerDB', {}).get('Backend') == 'V2InMemory'
     elif query.strip() == """
     . as $config
     |
@@ -294,7 +296,11 @@ class ShellIntegrationTests(unittest.TestCase):
             cls.tools[name] = executable
         names = ('cleanup_workspace', 'rollback_on_exit', 'verify_plan_inputs',
                  'install_config_file', 'prepare_activation', 'set_env_value',
-                 'version_at_least')
+                 'remove_legacy_tracer_keys',
+                 'version_at_least', 'read_env_path', 'infer_custom_binary_dir',
+                 'validate_custom_binary_target', 'classify_custom_binary_target',
+                 'snapshot_custom_binary_target', 'install_custom_binaries',
+                 'verify_service_process')
         logging = []
         for name in ('info', 'warn', 'error'):
             match = re.search(rf'^{name}\(\).*$', cls.shell, re.MULTILINE)
@@ -374,16 +380,21 @@ class ShellIntegrationTests(unittest.TestCase):
             'BACKUP_BIN_DIR': str(self.root / 'home/backup-bin'),
             'CONFIG_PLANNER': str(self.root / 'planner.py'),
             'SERVICE_NAME': 'synthetic.service', 'NETWORK': 'mainnet',
+              'BACKUP_SCOPE': 'mainnet', 'BINARY_DESTINATION_SOURCE': 'standard',
+              'TARGET_BINARY_DISPOSITION': 'standard', 'TARGET_BINARY_STATE_BEFORE': 'standard',
             'EXPECTED_NETWORK_MAGIC': '42', 'PROM_PORT': '12345',
             'TARGET_VERSION': '11.1.2', 'CURRENT_VERSION': '11.1.2',
             'CURRENT_NODE_BIN': str(self.active / 'cardano-node'),
             'CURRENT_CLI_BIN': str(self.active / 'cardano-cli'),
+              'CURRENT_NODE_HASH_BEFORE': digest(self.active / 'cardano-node'),
+              'CURRENT_CLI_HASH_BEFORE': digest(self.active / 'cardano-cli'),
             'CONFIG_HASH_BEFORE': digest(self.files / 'config.json'),
             'TOPOLOGY_HASH_BEFORE': digest(self.files / 'topology.json'),
             'ENV_HASH_BEFORE': digest(self.env_file), 'INITIAL_PID': '424242',
             'CURRENT_BACKEND': 'V2InMemory', 'LEDGER_BACKEND': 'V2InMemory',
             'LEDGER_BACKEND_EXPLICIT': 'false', 'KEEP_CONFIG': 'true',
             'NODE_ROLE': 'relay', 'DRY_RUN': 'false', 'FRESH_DB': 'false',
+              'CUSTOM_INSTANCE': 'false',
             'ASSUME_YES': 'true', 'CUSTOM_URL': '', 'REUSE_INSTALLED_BINARIES': 'true',
             'ROLLBACK_ARMED': 'false', 'NODE_WAS_ACTIVE': 'false',
             'BINARY_BACKUP_DIR': '', 'DB_BACKUP': '', 'ENV_CHANGED': 'false',
@@ -413,6 +424,7 @@ class ShellIntegrationTests(unittest.TestCase):
     def sandbox_env(self, fail_copy=False, faults=None):
         return {'PATH': str(self.bin), 'HOME': str(self.root / 'home'),
                 'TMPDIR': str(self.work), 'SANDBOX': str(self.root),
+                  'PROC_ROOT': str(self.root / 'proc'),
                 'SANDBOX_IDENTITY': 'service-user',
                 'LOCAL_TOOLS': json.dumps(self.tools), 'LC_ALL': 'C',
                 'PYTHONDONTWRITEBYTECODE': '1', 'FAIL_TOPOLOGY_COPY': str(int(fail_copy)),
@@ -494,6 +506,127 @@ done
         for role in ('bp', 'relay'):
             with self.subTest(role=role):
                 self.run_shell(self.argument_section() + f'\n[[ "$NODE_ROLE" == {role} ]]', ['--' + role])
+
+    def test_custom_only_flags_require_node_home(self):
+        for args in (('--service', 'lgc.service'), ('--binary-dir', '/home/test/cardano/bin')):
+            with self.subTest(args=args):
+                output = self.run_shell(self.argument_section(), ('--bp', *args), expected=None)
+                self.assertIn('only valid with --node-home', output)
+
+    def test_custom_instance_arguments_are_parsed(self):
+        self.run_shell(self.argument_section() + '''
+[[ "$NODE_HOME_OVERRIDE" == /opt/cardano/lgc ]]
+[[ "$SERVICE_OVERRIDE" == lgc.service ]]
+[[ "$BINARY_DIR_OVERRIDE" == /home/test/cardano-11.1.2/bin ]]
+''', ('--bp', '--node-home', '/opt/cardano/lgc', '--service', 'lgc.service',
+      '--binary-dir', '/home/test/cardano-11.1.2/bin'))
+
+    def test_custom_binary_path_is_read_and_versioned_sibling_is_inferred(self):
+        current = self.root / 'home/tmp/cardano-11.0.1/bin/cardano-node'
+        self.write(self.env_file, f'CNODEBIN="{current}"  # active Guild binary\n'.encode())
+        output = self.run_shell('''
+current=$(read_env_path CNODEBIN)
+[[ "$current" == "$EXPECTED_CURRENT" ]]
+infer_custom_binary_dir "$current" 11.0.1 11.1.2 ""
+''', overrides={'CNODE_HOME': str(self.root / 'node'),
+                 'EXPECTED_CURRENT': str(current)})
+        self.assertEqual(output.strip(), str(self.root / 'home/tmp/cardano-11.1.2/bin'))
+
+    def test_env_path_ignores_nested_runtime_fallbacks_but_rejects_duplicate_overrides(self):
+        current = self.root / 'home/tmp/cardano-11.0.1/bin/cardano-node'
+        self.write(self.env_file, f'''CNODEBIN="{current}"  # operator override
+if [[ -z "${{CNODEBIN}}" ]]; then
+  CNODEBIN=$(command -v cardano-node)
+fi
+'''.encode())
+        output = self.run_shell('read_env_path CNODEBIN')
+        self.assertEqual(output.strip(), str(current))
+
+        self.write(self.env_file, f'CNODEBIN="{current}"\nCNODEBIN="{current}"\n'.encode())
+        output = self.run_shell('read_env_path CNODEBIN', expected=None)
+        self.assertIn('Duplicate active CNODEBIN assignments', output)
+
+    def test_atomic_env_update_preserves_inline_comment(self):
+        self.write(self.env_file, b'''if [[ -z "${CNODEBIN}" ]]; then
+      CNODEBIN=$(command -v cardano-node)
+fi
+CNODEBIN="/old/cardano-node"  # operator note
+OTHER=value
+''')
+        self.run_shell('set_env_value "$ENV_FILE" CNODEBIN /new/cardano-node')
+        self.assertEqual(self.env_file.read_text(), '''if [[ -z "${CNODEBIN}" ]]; then
+      CNODEBIN=$(command -v cardano-node)
+fi
+CNODEBIN="/new/cardano-node"  # operator note
+OTHER=value
+''')
+
+        self.write(self.env_file, b'CNODEBIN="/one/cardano-node"\nCNODEBIN="/two/cardano-node"\n')
+        before = self.env_file.read_bytes()
+        output = self.run_shell('set_env_value "$ENV_FILE" CNODEBIN /new/cardano-node', expected=None)
+        self.assertIn('Duplicate active CNODEBIN assignments', output)
+        self.assertEqual(self.env_file.read_bytes(), before)
+
+    def test_legacy_tracer_cleanup_changes_only_configs_containing_legacy_keys(self):
+        before = self.inventory(self.files)
+        self.run_shell('remove_legacy_tracer_keys "$FILES_DIR/config.json"')
+        self.assertEqual(before, self.inventory(self.files))
+
+        config = json.loads((self.files / 'config.json').read_text())
+        config.update({'TurnOnLogging': True, 'TurnOnLogMetrics': True,
+                   'UseTraceDispatcher': True, 'CustomSetting': 'preserved'})
+        self.write(self.files / 'config.json', config)
+        self.run_shell('remove_legacy_tracer_keys "$FILES_DIR/config.json"')
+        cleaned = json.loads((self.files / 'config.json').read_text())
+        self.assertEqual(cleaned['CustomSetting'], 'preserved')
+        for key in ('TurnOnLogging', 'TurnOnLogMetrics', 'UseTraceDispatcher'):
+            self.assertNotIn(key, cleaned)
+
+    def test_custom_binary_path_rejects_shared_local_bin(self):
+        output = self.run_shell(
+            'infer_custom_binary_dir "$CURRENT_NODE_BIN" 11.0.1 11.1.2 "$HOME/.local/bin"',
+            expected=None, overrides={'CNODE_HOME': str(self.root / 'node')})
+        self.assertIn('may not target shared binary directory', output)
+
+    def test_custom_target_rejects_unrelated_live_process(self):
+        target = self.root / 'home/tmp/cardano-11.1.2/bin'
+        target.mkdir(parents=True)
+        process = self.root / 'proc/99'
+        process.mkdir(parents=True)
+        (process / 'exe').symlink_to(target / 'cardano-node')
+        self.write(target / 'cardano-node', b'binary')
+        output = self.run_shell(
+            'validate_custom_binary_target "$TARGET" 424242 "$PROC_ROOT"', expected=None,
+            overrides={'TARGET': str(target), 'PROC_ROOT': str(self.root / 'proc')})
+        self.assertIn('Unrelated live process 99', output)
+
+    def test_custom_target_reuses_only_exact_staged_package(self):
+        target = self.root / 'home/tmp/cardano-11.1.2/bin'
+        target.mkdir(parents=True)
+        for name in ('cardano-node', 'cardano-cli'):
+            data = (name + '-11.1.2').encode()
+            self.write(self.staged_bin / name, data)
+            self.write(target / name, data)
+        output = self.run_shell('classify_custom_binary_target "$TARGET" "$STAGED_BIN_DIR"',
+                                overrides={'TARGET': str(target)})
+        self.assertEqual(output.strip(), 'reuse')
+        self.write(target / 'unexpected', b'conflict')
+        output = self.run_shell('classify_custom_binary_target "$TARGET" "$STAGED_BIN_DIR"',
+                                expected=None, overrides={'TARGET': str(target)})
+        self.assertIn('does not exactly match', output)
+
+    def test_custom_install_refuses_symlink_target_without_touching_destination(self):
+        target = self.root / 'home/tmp/cardano-11.1.2/bin'
+        destination = self.root / 'home/.local/bin'
+        destination.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        target.symlink_to(destination, target_is_directory=True)
+        self.write(destination / 'cardano-node', b'apex sentinel')
+        self.write(self.staged_bin / 'cardano-node', b'new node')
+        output = self.run_shell('install_custom_binaries "$TARGET" "$STAGED_BIN_DIR"',
+                                expected=None, overrides={'TARGET': str(target)})
+        self.assertTrue(output.strip())
+        self.assertEqual((destination / 'cardano-node').read_bytes(), b'apex sentinel')
 
     def test_yes_does_not_authorize_backend_database_replacement(self):
         before = self.inventory(self.db)
@@ -618,6 +751,12 @@ jq() {
         output = self.run_shell(gate, expected=None, overrides={'DRY_RUN': 'true'})
         self.assertIn('Inputs changed', output)
         self.assertEqual(before, self.inventory(self.root / 'node', self.root / 'home'))
+
+    def test_changed_current_binary_is_refused_before_activation(self):
+        self.make_plans()
+        (self.active / 'cardano-node').write_bytes(b'concurrent binary replacement')
+        output = self.run_shell('verify_plan_inputs', expected=None)
+        self.assertIn('Current cardano-node changed since planning', output)
 
     def test_changed_config_and_topology_are_both_installed(self):
         self.make_plans()
@@ -765,6 +904,20 @@ exit 42
         self.assertIn('ROLLBACK INCOMPLETE', output)
         self.assertEqual((self.files / 'config.json').read_bytes(), b'damaged backup')
         self.assert_no_restart()
+
+    def test_rollback_current_binary_mismatch_never_restarts(self):
+        self.make_plans()
+        body = self.backup_setup() + '''
+ROLLBACK_ARMED=true
+NODE_WAS_ACTIVE=true
+trap rollback_on_exit EXIT
+printf '%s' 'concurrent binary replacement' > "$CURRENT_NODE_BIN"
+exit 42
+'''
+        output = self.run_shell(body, expected=42)
+        self.assertIn('ROLLBACK INCOMPLETE', output)
+        self.assert_no_restart()
+        self.assertEqual((self.root / 'service-state').read_text(), 'inactive')
 
     def test_unarmed_failure_and_success_clean_workspace_without_rollback(self):
         before = self.inventory(self.root / 'node', self.root / 'home')
@@ -927,12 +1080,16 @@ exit 42
         self.assertEqual(text.count(old), count, f'Shell substitution changed: {old!r}')
         return text.replace(old, new)
 
-    def proc_fixture(self):
+    def proc_fixture(self, executable=None, block_producer=False):
         proc = self.root / 'proc/424242'
         proc.mkdir(parents=True, exist_ok=True)
-        self.write(proc / 'cmdline', ('cardano-node\0run\0--config\0' + str(self.files / 'config.json') +
-                                    '\0--topology\0' + str(self.files / 'topology.json') + '\0').encode())
-        (proc / 'exe').symlink_to(self.active / 'cardano-node')
+        arguments = ('cardano-node\0run\0--config\0' + str(self.files / 'config.json') +
+                     '\0--topology\0' + str(self.files / 'topology.json') +
+                     '\0--database-path\0' + str(self.db))
+        if block_producer:
+            arguments += '\0--shelley-kes-key\0synthetic-kes.skey'
+        self.write(proc / 'cmdline', (arguments + '\0').encode())
+        (proc / 'exe').symlink_to(executable or self.active / 'cardano-node')
         (proc / 'cwd').symlink_to(self.root)
 
     def startup_section(self):
@@ -947,6 +1104,25 @@ exit 42
             'VALIDATION_STARTED_AT': '2026-09-18T01:02:03+00:00',
             'STARTUP_VALIDATION_TIMEOUT_SECONDS': '2'})
 
+    def test_service_identity_rejects_wrong_database_and_role(self):
+        self.proc_fixture()
+        wrong_database = self.root / 'other-db'
+        cmdline_path = self.root / 'proc/424242/cmdline'
+        cmdline = cmdline_path.read_bytes()
+        cmdline_path.write_bytes(
+            cmdline.replace(str(self.db).encode(), str(wrong_database).encode()))
+        output = self.run_shell(
+            'export PYTHONOPTIMIZE=1; verify_service_process 424242 "$ACTIVE_BIN_DIR/cardano-node"',
+            expected=None)
+        self.assertIn('Unexpected active --database-path', output)
+
+        cmdline_path.write_bytes(cmdline)
+        output = self.run_shell(
+            'export PYTHONOPTIMIZE=1; verify_service_process 424242 "$ACTIVE_BIN_DIR/cardano-node"',
+            expected=None,
+            overrides={'NODE_ROLE': 'bp'})
+        self.assertIn('Declared role contradicts active forging arguments', output)
+
     def test_startup_journal_access_failure_is_not_reported_as_clean(self):
         output = self.run_startup({'journal_failure': 'general'}, expected=1)
         self.assertIn('Journal probe failed', output)
@@ -960,10 +1136,10 @@ exit 42
         self.assertNotIn('journal errors: PASS', output)
         self.assertNotIn('Startup validation passed', output)
 
-    def test_startup_requires_journal_evidence_for_new_invocation(self):
-        output = self.run_startup({'journal_text': ''}, expected=1)
-        self.assertIn('Journal evidence unavailable for new invocation', output)
-        self.assertNotIn('Startup validation passed', output)
+    def test_startup_allows_empty_general_journal_when_runtime_evidence_passes(self):
+        output = self.run_startup({'journal_text': ''})
+        self.assertIn('journal errors: PASS (queries succeeded; none detected)', output)
+        self.assertIn('Startup validation passed', output)
 
     def test_startup_rejects_changed_invocation_before_journal_probe(self):
         output = self.run_startup({'invocation': 'b' * 32}, expected=1)
@@ -999,8 +1175,9 @@ exit 42
         text = self.replace_exact(text, "pathlib.Path('/proc')", f'pathlib.Path({str(self.root / "proc")!r})')
         for pid in ('INITIAL_PID', 'MAIN_PID'):
             text = self.replace_exact(text, f'"/proc/${{{pid}}}/exe"',
-                                      f'"${{SANDBOX}}/proc/${{{pid}}}/exe"')
-        self.assertNotIn('/opt/cardano/', text)
+                                      f'"${{SANDBOX}}/proc/${{{pid}}}/exe"',
+                                      count=2 if pid == 'INITIAL_PID' else 1)
+        self.assertNotIn('CNODE_HOME="/opt/cardano/', text)
         self.assertNotIn('"/proc/', text)
         self.assertNotIn("Path('/proc')", text)
         text = self.replace_exact(text, 'set -euo pipefail\n', 'set -euo pipefail\n'
@@ -1017,6 +1194,10 @@ exit 42
 
     def full_script_dry_run(self, corrupt=None):
         self.network_fixture(magic=764824073)
+        config = json.loads((self.files / 'config.json').read_text())
+        config.update({'TurnOnLogging': True, 'TurnOnLogMetrics': True,
+                       'UseTraceDispatcher': True})
+        self.write(self.files / 'config.json', config)
         snapshot = json.loads((self.files / 'snapshot.json').read_text())
         snapshot['NetworkMagic'] = 764824073
         self.write(self.files / 'snapshot.json', snapshot)
@@ -1051,6 +1232,10 @@ exit 42
         if not corrupt:
             self.assertIn(['cardano-cli', 'byron', 'genesis', 'print-genesis-hash',
                            '--genesis-json', str(self.files / 'byron-genesis.json')], calls)
+            self.assertIn('Unsupported legacy tracer keys will be removed', output)
+            for key in ('TurnOnLogging', 'TurnOnLogMetrics', 'UseTraceDispatcher'):
+                self.assertIn(key, output)
+                self.assertIn(f'-  "{key}": true', output)
             self.assertIn('Dry run passed', output)
         else:
             self.assertNotIn('Dry run passed', output)
@@ -1058,6 +1243,42 @@ exit 42
 
     def test_full_script_sandbox_dry_run_stages_and_validates_without_live_mutation(self):
         self.full_script_dry_run()
+
+    def test_full_script_custom_instance_dry_run_preserves_apex_binary_and_live_files(self):
+        self.network_fixture(magic=764824073)
+        topology = json.loads((self.files / 'topology.json').read_text())
+        topology['useLedgerAfterSlot'] = -1
+        self.write(self.files / 'topology.json', topology)
+        snapshot = json.loads((self.files / 'snapshot.json').read_text())
+        snapshot['NetworkMagic'] = 764824073
+        self.write(self.files / 'snapshot.json', snapshot)
+        current = self.root / 'home/tmp/cardano-11.1.2/bin'
+        current.mkdir(parents=True)
+        for name in ('cardano-node', 'cardano-cli'):
+            self.write(current / name, (self.active / name).read_bytes())
+            (current / name).chmod(0o755)
+        self.write(self.env_file,
+                   f'CNODEBIN="{current / "cardano-node"}"\nCCLI="{current / "cardano-cli"}"\n'.encode())
+        self.proc_fixture(current / 'cardano-node', block_producer=True)
+        apex = self.root / 'home/.local/bin/cardano-node'
+        self.write(apex, b'apex shared binary sentinel')
+        apex.chmod(0o755)
+        script = self.transformed_script()
+        before = self.inventory(self.root / 'node', self.root / 'home')
+        result = subprocess.run([
+            BASH, '--noprofile', '--norc', str(script), '--network', 'mainnet',
+            '--node-home', str(self.root / 'node'), '--service', 'synthetic.service',
+            '--bp', '--version', '11.1.2', '--keep-config', '--dry-run', '--yes'],
+            cwd=self.root, env=self.sandbox_env(), text=True, capture_output=True, timeout=30)
+        output = self.check_result(result, 0)
+        self.assertIn(f'Install path:   {current} (inferred)', output)
+        self.assertIn('Binary target:  reuse', output)
+        self.assertIn('Dry run passed', output)
+        self.assertEqual(before, self.inventory(self.root / 'node', self.root / 'home'))
+        self.assertEqual(apex.read_bytes(), b'apex shared binary sentinel')
+        self.assertEqual((self.root / 'service-state').read_text(), 'active')
+        calls = self.commands()
+        self.assertFalse(any(call[0] in ('sudo', 'curl', 'wget', 'apt-get', 'dpkg') for call in calls))
 
     def test_full_script_dry_run_rejects_corrupt_checkpoints_before_success(self):
         self.assertIn('Checkpoints hash mismatch', self.full_script_dry_run('checkpoints.json'))
