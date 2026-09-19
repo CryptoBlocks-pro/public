@@ -115,6 +115,22 @@ preserved the existing genesis file/hash, and removed only the unsupported legac
 tracer selectors in addition to the documented Praos/P2P/BP normalization. Never
 weaken the genesis identity guard to make a refresh pass.
 
+On 2026-09-19, the same version/keep-config policy was exercised for the first time
+on the **standard (non-custom) code path**: the Guild-standard mainnet BP at
+`/opt/cardano/cnode` (service `cnode.service`, installing into the shared
+`~/.local/bin`) on Linux aarch64, from cardano-node 11.0.1 to 11.1.2. Role was
+confirmed from the running process's forging arguments, not the hostname. Before
+running anything live, `~/.local/bin` was independently confirmed to be used by no
+other live cardano/apex/node service on that VM. The dry run and then the live run
+both passed on the first attempt: no rollback, byte-identical topology and genesis
+hashes preserved, `PeerSharing: false` and legacy tracer-key removal applied as
+planned, the pre-existing Guild env required no change, the unrelated `mithril-client`
+binary in the same directory was independently confirmed byte-unchanged, and the
+node reached advancing tip/slot with active peers shortly after restart. This clears
+the standard code path for fleet use under the same one-VM-at-a-time discipline as
+the custom-instance path; it is not a claim that every standard-layout variant,
+network or role has been exercised.
+
 Roll out one VM at a time:
 
 1. Use an up-to-date checkout of the complete repository and run the Bash syntax,
@@ -133,6 +149,38 @@ Roll out one VM at a time:
   invocation-scoped error journal. Confirm unrelated/shared binaries are unchanged.
 6. Retain that run's matching config/env/binary backups until the VM has remained
   operationally healthy. Stop the fleet rollout on any rollback or unexplained diff.
+
+### Lightweight fast-path prompt (after multiple clean canaries)
+
+As of 2026-09-19, roughly 8 VMs across the custom and standard code paths have
+completed this rollout without a rollback or unexplained diff. For those already-
+proven layouts, the full per-VM inventory (step 2 above) and independent
+post-upgrade verification (step 5 above) may be skipped to save time; this is a
+scope reduction agreed for routine VMs, not a claim that verification is
+unnecessary. Still require an explicit role flag, still gate the live run on a
+clean dry run and explicit approval, and still never use `--yes`,
+`--refresh-config` or `--fresh-db` to work around a failed preflight. Re-run the
+full inventory-and-verification workflow above (not this fast path) for any VM
+that is a custom instance being run for the first time, has an unclear or
+ambiguous role/layout, or where the dry run fails or the live run rolls back.
+
+Sample prompt for a routine VM:
+
+> Upgrade the Cardano node on `<hostname>` to `<X.Y.Z>` using our repo script.
+> Service is `<name>.service`. Update/clone the checkout used last time and
+> confirm it's at commit `<commit>` or later. Confirm the role (`--relay` or
+> `--bp`) from the running process's actual forging arguments, never the
+> hostname. Then, as the systemd service user, run:
+>
+> `./upgrade-cardano-node.sh --network <network> --version <X.Y.Z> (--relay|--bp) --keep-config --dry-run`
+>
+> Show me the full output. If it fails, stop and report — do not retry with
+> `--refresh-config`, `--fresh-db` or `--yes`. If it passes, wait for my
+> explicit approval, then rerun the identical command without `--dry-run`
+> (add `--yes` only if I approved it). Report the final status line, whether
+> the service is active afterward, and the retained backup paths. Skip the
+> full manual inventory and independent post-upgrade verification for this
+> routine run.
 
 ## Discovery and privacy
 
